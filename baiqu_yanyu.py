@@ -41,7 +41,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from PIL import Image, ImageGrab
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 if getattr(sys, "frozen", False):
     # PyInstaller onefile: 资源解压在 sys._MEIPASS
@@ -64,6 +64,8 @@ HAND_SIZE = 5                  # 手牌张数
 # 卡牌取样框(相对单张卡牌矩形): cx, cy, 半宽, 半高; 由 2560x1600 截图测量
 RANK_BOX = (0.1104, 0.1173, 0.1015, 0.0752)   # 点数
 SUIT_BOX = (0.2985, 0.1283, 0.0597, 0.0487)   # 花色(小字形)
+
+SEARCH_MARGIN = 0.05           # 取样框外扩比例(相对卡宽), 容忍卡槽推算的几像素误差
 
 MATCH_MIN = 0.55               # 模板匹配最低分(0~1)
 MATCH_MARGIN = 0.04            # 第一名与第二名的最小差距, 否则视为不确定
@@ -105,7 +107,7 @@ RANKS = (1, 2, 3, 4, 5)
 PATTERNS = {
     "straight": ("顺子", "五张内出现四连(1-2-3-4 或 2-3-4-5)"),
     "flush": ("同花", "抽到四张同花色即停"),
-    "straight_flush": ("同花顺", "五张同花色且出现四连"),
+    "straight_flush": ("同花顺", "五张同花色, 且点数恰好是 1-2-3-4-5"),
     "four": ("四条", "五张内有四张同点数(五条也算)"),
     "full_house": ("葫芦", "五张内 三张同点 + 两张同点"),
     "three": ("三条", "五张内有三张同点数"),
@@ -502,18 +504,54 @@ def load_templates() -> Dict[str, Image.Image]:
     return _TPL
 
 
-def _ncc(patch: np.ndarray, tpl: Image.Image) -> float:
-    """模板缩放到取样框同尺寸后做归一化互相关(同为低分辨率, 避免上采样模糊)。"""
-    h, w = patch.shape
-    if h < 8 or w < 8:
+def _ncc(win: np.ndarray, tz: np.ndarray, tn: float) -> float:
+    a = win - float(win.mean())
+    den = float(np.sqrt((a * a).sum())) * tn + 1e-6
+    return float((a * tz).sum() / den)
+
+
+def _scan(patch, tz, tn, xs, ys, th, tw):
+    best, bx, by = -1.0, 0, 0
+    for oy in ys:
+        for ox in xs:
+            win = patch[oy:oy + th, ox:ox + tw]
+            if win.shape != (th, tw):
+                continue
+            sc = _ncc(win, tz, tn)
+            if sc > best:
+                best, bx, by = sc, ox, oy
+    return best, bx, by
+
+
+def _match(patch: np.ndarray, tpl: Image.Image, size, offsets, refine=False) -> float:
+    """模板缩放到取样尺寸后, 按 offsets 平移取最高 NCC。
+
+    平移是为了容忍卡槽推算的几像素误差(窗口化时 卡槽间距/缩放 不完全一致)。
+    refine=True 时先粗搜再在最佳点附近 ±2px 细搜, 兼顾范围与速度。
+    """
+    tw, th = size
+    if patch.shape[0] < th or patch.shape[1] < tw:
         return 0.0
-    t = np.asarray(tpl.resize((w, h), Image.LANCZOS), dtype=np.float32)
-    a = patch - float(patch.mean())
-    b = t - float(t.mean())
-    den = float(np.sqrt((a * a).sum() * (b * b).sum()))
-    if den < 1e-6:
-        return 0.0
-    return float((a * b).sum() / den)
+    t = np.asarray(tpl.resize((tw, th), Image.LANCZOS), dtype=np.float32)
+    tz = t - float(t.mean())
+    tn = float(np.sqrt((tz * tz).sum())) + 1e-6
+    offs = tuple(offsets)
+    if refine and len(offs) > 1:
+        coarse = offs[::3] if len(offs) > 5 else offs
+        best, bx, by = _scan(patch, tz, tn, coarse, coarse, th, tw)
+        fine = [v for v in range(max(0, bx - 2), min(patch.shape[1] - tw, bx + 2) + 1)
+                if v >= 0]
+        finey = [v for v in range(max(0, by - 2), min(patch.shape[0] - th, by + 2) + 1)
+                 if v >= 0]
+        best2, _, _ = _scan(patch, tz, tn, fine, finey, th, tw)
+        return max(best, best2, 0.0)
+    best, _, _ = _scan(patch, tz, tn, offs, offs, th, tw)
+    return max(best, 0.0)
+
+
+def _box_with_margin(s: Slot, spec, margin: int):
+    x0, y0, x1, y1 = box_of(s, spec)
+    return x0 - margin, y0 - margin, x1 + margin, y1 + margin
 
 
 def _best(scores: Dict[str, float]) -> Tuple[Optional[str], float, float]:
@@ -526,17 +564,31 @@ def _best(scores: Dict[str, float]) -> Tuple[Optional[str], float, float]:
     return key, float(score), float(margin)
 
 
-def read_card(gray: np.ndarray, s: Slot) -> Card:
-    """读取一张已翻开的牌: 点数 + 花色。不确定的项记为 None。"""
+def read_card(gray: np.ndarray, s: Slot, thorough: bool = False) -> Card:
+    """读取一张已翻开的牌: 点数 + 花色。不确定的项记为 None。
+
+    thorough=False 只在中心位置比对一次; True 时在 ±SEARCH_MARGIN 内逐 2px 搜索。
+    """
     tpl = load_templates()
-    x0, y0, x1, y1 = box_of(s, RANK_BOX)
+    m = max(2, int(round(SEARCH_MARGIN * s.w)))
+    offsets = tuple(range(0, 2 * m + 1)) if thorough else (m,)
     H, W = gray.shape[:2]
+
+    # 取样尺寸与中心位置必须用同一套整数坐标, 否则会差 1~2px 拉低分数
+    rb = box_of(s, RANK_BOX)
+    tw, th = max(12, rb[2] - rb[0]), max(12, rb[3] - rb[1])
+    x0, y0, x1, y1 = rb[0] - m, rb[1] - m, rb[2] + m, rb[3] + m
     rpatch = gray[max(0, y0):min(H, y1), max(0, x0):min(W, x1)]
-    x0, y0, x1, y1 = box_of(s, SUIT_BOX)
+
+    sb = box_of(s, SUIT_BOX)
+    sw, sh = max(10, sb[2] - sb[0]), max(10, sb[3] - sb[1])
+    x0, y0, x1, y1 = sb[0] - m, sb[1] - m, sb[2] + m, sb[3] + m
     spatch = gray[max(0, y0):min(H, y1), max(0, x0):min(W, x1)]
 
-    rank_scores = {str(r): _ncc(rpatch, tpl[f"r{r}"]) for r in RANKS}
-    suit_scores = {s_: _ncc(spatch, tpl[f"s_{s_}"]) for s_ in SUITS}
+    rank_scores = {str(r): _match(rpatch, tpl[f"r{r}"], (tw, th), offsets, thorough)
+                   for r in RANKS}
+    suit_scores = {s_: _match(spatch, tpl[f"s_{s_}"], (sw, sh), offsets, thorough)
+                   for s_ in SUITS}
     rk, rs, rm = _best(rank_scores)
     sk, ss, sm = _best(suit_scores)
 
@@ -545,7 +597,8 @@ def read_card(gray: np.ndarray, s: Slot) -> Card:
     return Card(rank, suit, rs, ss)
 
 
-def analyze_slots(img: Image.Image, prev_slots=None, a=None, gray=None):
+def analyze_slots(img: Image.Image, prev_slots=None, a=None, gray=None,
+                  thorough: bool = False):
     """返回 (slots, cards)。cards 只包含已翻开且识别成功的牌(按槽位顺序)。"""
     if a is None:
         a = np.asarray(img.convert("RGB")).astype(np.int16)
@@ -556,9 +609,16 @@ def analyze_slots(img: Image.Image, prev_slots=None, a=None, gray=None):
     cards = []
     for s in slots:
         s.revealed = is_revealed(a, s)
-        s.card = read_card(gray, s) if s.revealed else None
-        if s.revealed and s.card is not None and s.card.known:
-            cards.append(s.card)
+        if not s.revealed:
+            s.card = None
+            continue
+        c = read_card(gray, s, False)
+        if thorough and (c is None or not c.known):
+            # 只对没认准的牌做逐像素搜索, 避免每帧都慢
+            c = read_card(gray, s, True)
+        s.card = c
+        if c is not None and c.known:
+            cards.append(c)
     return slots, cards
 
 
@@ -648,7 +708,9 @@ def is_hit(cards: List[Card], target: str) -> bool:
     if target == "straight":
         return has_straight4(cards)
     if target == "straight_flush":
-        return len(suit_counts(cards)) == 1 and has_straight4(cards)
+        # 五张同花色 + 点数恰好 1-2-3-4-5(五张顺子)
+        return (len(suit_counts(cards)) == 1
+                and set(rank_counts(cards)) == {1, 2, 3, 4, 5})
     if target == "four":
         return has_four(cards)
     if target == "full_house":
@@ -679,12 +741,12 @@ def can_complete(cards: List[Card], target: str) -> bool:
         return any(len([r for r in w if r not in have]) <= rem
                    for w in STRAIGHT_WINDOWS)
     if target == "straight_flush":
-        # 要求五张同花色, 花色一旦不齐就不可能
+        # 五张同花色 + 恰好 1-5 各一张: 花色不齐或出现重复点数都不可能
         if len(sc) > 1:
             return False
-        have = set(rc)
-        return any(len([r for r in w if r not in have]) <= rem
-                   for w in STRAIGHT_WINDOWS)
+        if any(v > 1 for v in rc.values()):
+            return False
+        return len({1, 2, 3, 4, 5} - set(rc)) <= rem
     if target == "four":
         return max_rank + rem >= 4
     if target == "three":
@@ -748,10 +810,11 @@ class Frame:
     unknown: int = 0
 
 
-def inspect(img: Image.Image, prev_slots=None, with_start: bool = False) -> Frame:
+def inspect(img: Image.Image, prev_slots=None, with_start: bool = False,
+            thorough: bool = False) -> Frame:
     a = np.asarray(img.convert("RGB")).astype(np.int16)
     gray = np.asarray(img.convert("L")).astype(np.float32)
-    slots, cards = analyze_slots(img, prev_slots, a=a, gray=gray)
+    slots, cards = analyze_slots(img, prev_slots, a=a, gray=gray, thorough=thorough)
     revealed = sum(1 for s in slots if s.revealed)
     names = ("draw", "abandon", "confirm") + (("start",) if with_start else ())
     buttons = {name: find_button(a, name) for name in names}
@@ -864,10 +927,17 @@ def live(args) -> int:
             print(f"[!] {e}")
             return False
 
-    fr = inspect(snap())
+    shot = snap()
+    fr = inspect(shot)
     print(f"初始: 手牌 {fr.revealed}/{HAND_SIZE} -> {fmt_cards(fr.cards)}")
+    dump = getattr(args, "dump", None)
+    if dump:
+        shot.save(dump)
+        print(f"已保存窗口截图: {dump}")
+        if not args.check:
+            return 0
     if args.check:
-        cmd_check(snap())
+        cmd_check(shot)
         return 0
     print("─" * 56)
 
@@ -900,6 +970,10 @@ def live(args) -> int:
                 continue
 
             if fr.unknown:
+                # 中心位置没认准, 改用逐像素平移搜索再试一次
+                fr = inspect(snap(), prev_slots, thorough=True)
+                prev_slots = fr.slots
+            if fr.unknown:
                 unknown_streak += 1
                 if unknown_streak > UNKNOWN_GIVE_UP:
                     print(f"[!] 有 {fr.unknown} 张牌识别不确定, 停止脚本以免误放弃。")
@@ -907,7 +981,7 @@ def live(args) -> int:
                         if s.revealed and (s.card is None or not s.card.known):
                             print(f"    槽位 #{i+1} 点数分={s.card.rank_score if s.card else 0:.2f} "
                                   f"花色分={s.card.suit_score if s.card else 0:.2f}")
-                    print("    请把当时的截图发给我, 我再补模板。")
+                    print("    请运行 `baiqu_yanyu.py --check --dump shot.png` 把 shot.png 发给我。")
                     return 6
                 time.sleep(0.12)
                 continue
@@ -1065,6 +1139,8 @@ def main():
     ap.add_argument("--hwnd", type=lambda s: int(s, 0),
                     help="手动指定窗口句柄(如 0x123456)")
     ap.add_argument("--debug", action="store_true", help="打印每张牌的识别分数")
+    ap.add_argument("--dump", metavar="PATH",
+                    help="把脚本看到的窗口画面存成 PNG(排查识别问题用)")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args()
 
