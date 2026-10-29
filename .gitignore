@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Local debug output / test screenshots
+debug/
+refs/
+*.log
+
+# Build artifacts / local toolchain
+build/
+build-*/
+dist/
+vendor/
+.build-venv/
+.build-tmp/
+.wheels/
+.tmp/
+.mei/
+.pip-cache/
+*.pkg
+*_onedir.spec
+
+# Editors
+.idea/
+.vscode/
