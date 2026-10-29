@@ -104,7 +104,7 @@ def run(target, script, verbose=False):
     m.activate = lambda h: True
     m.client_rect = lambda h: (0, 0, 2560, 1600)
     m.grab = lambda rect: None
-    m.inspect = lambda img, prev_slots=None, with_start=False: game.frame()
+    m.inspect = lambda img, prev_slots=None, with_start=False, cache=None: game.frame()
     m.user32 = FakeUser32(hwnd)
     m.time.sleep = lambda s: None
     m.time.perf_counter = lambda: 0.0

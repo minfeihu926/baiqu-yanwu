@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 百趣演武 · 自动抽牌(第一轮)
@@ -44,7 +44,7 @@ from typing import Dict, List, Optional
 import numpy as np
 from PIL import Image, ImageGrab
 
-__version__ = "1.2.3"
+__version__ = "1.3.0"
 
 if getattr(sys, "frozen", False):
     # PyInstaller onefile: 资源解压在 sys._MEIPASS
@@ -727,7 +727,8 @@ class Frame:
     teal: int = 0
 
 
-def analyze_slots(img: Image.Image, prev_slots=None, a=None, gray=None):
+def analyze_slots(img: Image.Image, prev_slots=None, a=None, gray=None,
+                  cache=None):
     if a is None:
         a = np.asarray(img.convert("RGB")).astype(np.int16)
     if gray is None:
@@ -735,18 +736,27 @@ def analyze_slots(img: Image.Image, prev_slots=None, a=None, gray=None):
     teal = detect_teal_slots(img, a)
     slots = infer_slots(img, teal, prev_slots)
     cards = []
-    for s in slots:
+    for i, s in enumerate(slots):
         s.revealed = is_revealed(a, s)
-        s.card = read_card(gray, s) if s.revealed else None
-        if s.revealed and s.card is not None and s.card.known:
-            cards.append(s.card)
+        if not s.revealed:
+            s.card = None
+            continue
+        c = cache.get(i) if cache is not None else None
+        if c is None or not c.known:
+            c = read_card(gray, s)
+            if cache is not None and c is not None and c.known:
+                cache[i] = c   # 同一局里这张牌不会变, 认准一次就复用
+        s.card = c
+        if c is not None and c.known:
+            cards.append(c)
     return slots, cards, len(teal)
 
 
-def inspect(img: Image.Image, prev_slots=None, with_start: bool = False) -> Frame:
+def inspect(img: Image.Image, prev_slots=None, with_start: bool = False,
+            cache=None) -> Frame:
     a = np.asarray(img.convert("RGB")).astype(np.int16)
     gray = np.asarray(img.convert("L")).astype(np.float32)
-    slots, cards, teal_n = analyze_slots(img, prev_slots, a=a, gray=gray)
+    slots, cards, teal_n = analyze_slots(img, prev_slots, a=a, gray=gray, cache=cache)
     revealed = sum(1 for s in slots if s.revealed)
     names = ("draw", "abandon", "confirm") + (("start",) if with_start else ())
     buttons = {name: find_button(a, name) for name in names}
@@ -754,15 +764,16 @@ def inspect(img: Image.Image, prev_slots=None, with_start: bool = False) -> Fram
                  unknown=max(0, revealed - len(cards)), teal=teal_n)
 
 
-def wait_frame(grabber, pred, timeout, prev_slots=None, interval=0.06):
+def wait_frame(grabber, pred, timeout, prev_slots=None, interval=0.0, cache=None):
     end = time.time() + timeout
     last = None
     while time.time() < end:
-        fr = inspect(grabber(), prev_slots)
+        fr = inspect(grabber(), prev_slots, cache=cache)
         last = fr
         if pred(fr):
             return fr, True
-        time.sleep(interval)
+        if interval:
+            time.sleep(interval)
     return last, False
 
 
@@ -886,7 +897,6 @@ def live(args) -> int:
         if not ok:
             print("[!] 确认后没有回到抽牌界面, 停止。")
             return False, 9
-        time.sleep(0.25)   # 等新一局发牌动画走完
         return True, 0
 
     shot = snap()
@@ -912,6 +922,7 @@ def live(args) -> int:
         if args.rounds and round_no > args.rounds:
             break
         prev_slots = None
+        card_cache = {}
         prev_cards: List[Card] = []
         low_since = None
         stalls = 0
@@ -922,12 +933,13 @@ def live(args) -> int:
             if user32.GetForegroundWindow() != hwnd:
                 print("游戏窗口不在前台, 停止。")
                 return 3
-            fr = inspect(snap(), prev_slots)
+            fr = inspect(snap(), prev_slots, cache=card_cache)
             prev_slots = fr.slots
+            if fr.revealed == 0:
+                card_cache.clear()   # 桌面清空 = 这一局重置了, 别复用旧牌
             if fr.buttons.get("confirm"):
                 if not safe_click(fr.buttons["confirm"]):
                     return 3
-                time.sleep(0.8)
                 continue
 
             # 同一局里牌只增不减: 某一帧漏识别不能让张数倒退;
@@ -958,8 +970,7 @@ def live(args) -> int:
                 # 放弃不可逆: 先复查一帧, 防止翻牌动画/识别抖动误判
                 reason = (f"抽满 5 张仍未达成{pat_cn}" if n >= HAND_SIZE
                           else f"已抽 {n} 张, {pat_cn}已不可能")
-                time.sleep(0.15)
-                fr2 = inspect(snap(), prev_slots)
+                fr2 = inspect(snap(), prev_slots, cache=card_cache)
                 prev_slots = fr2.slots
                 if (len(fr2.cards) >= n and fr2.cards
                         and decide(fr2.cards, target) != "abandon"):
@@ -993,7 +1004,6 @@ def live(args) -> int:
                         return code
                     abandons += 1
                     break
-                time.sleep(0.12)
                 continue
             no_draw = 0
             gap = (time.perf_counter() - last_draw_t) if last_draw_t else 0.0
@@ -1008,17 +1018,14 @@ def live(args) -> int:
             deadline = last_click + DRAW_WAIT
             got_new = False
             while time.perf_counter() < deadline:
-                time.sleep(0.05)
-                fr2 = inspect(snap(), prev_slots)
+                fr2 = inspect(snap(), prev_slots, cache=card_cache)
                 prev_slots = fr2.slots
                 if fr2.buttons.get("confirm"):
                     safe_click(fr2.buttons["confirm"])
-                    time.sleep(0.5)
                     got_new = True
                     break
                 if fr2.revealed > before or fr2.teal < before_teal:
                     got_new = True
-                    time.sleep(0.10)
                     break
             if got_new:
                 stalls = 0
