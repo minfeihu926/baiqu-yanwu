@@ -3,30 +3,33 @@
 """
 百趣演武 · 自动抽牌(第一轮)
 
-每张牌识别 点数(1-5) + 花色(万/条/筒), 按你选的目标牌型判断:
+逐张抽牌, 每张牌识别 点数(1-5) + 花色(万/条/筒), 按选定的目标牌型判断:
 
-  顺子      抽满 5 张, 其中出现四连(1-2-3-4 或 2-3-4-5)即中
-  同花      抽到 4 张同花色即停(不必抽满 5 张)
-  同花顺    抽满 5 张, 五张同花色且出现四连
-  四条      抽满 5 张, 有 4 张同点数(五条也算)
-  葫芦      抽满 5 张, 3 张同点 + 2 张同点
-  三条      抽满 5 张, 有 3 张同点数
-  两对      抽满 5 张, 两个不同点数各至少 2 张
+  顺子      抽满 5 张, 出现四连(1-2-3-4 或 2-3-4-5)
+  同花      已抽的牌绝对同色, 凑到 4 张即停
+  同花顺    五张同花色, 且点数恰好 1-2-3-4-5
+  四条      五张内有四张同点数(五条也算)
+  葫芦      五张内 三张同点 + 两张同点
+  三条      五张内有三张同点数
+  两对      五张内两个不同点数各至少两张
 
-中途只要判定"目标已不可能", 立即「放弃挑战」→「确认」→ 重抽;
-凑成目标则停手、打印结果、脚本退出(不点「开始挑战」)。
-轮数默认无上限, 随时 Ctrl+C 结束。
+判定用"包含"语义: 更大的牌型也算达成。
+中途判断出目标已不可能 -> 「放弃挑战」→「确认」→ 重抽;
+达成目标 -> 停手、打印结果、脚本退出(不点「开始挑战」)。
+轮数默认无上限, Ctrl+C 结束。
 
-目标窗口: 终末地, 窗口模式, 运行时必须在前台。
+识别沿用 1.0 的做法: 模板(带白边的图块)按卡牌高度缩放, 在卡牌左上角取框内
+整幅滑动做归一化互相关, 再乘 0.8~1.2 五档缩放, 取最高分。
+
 依赖: numpy, pillow
 许可证: MIT
 
 用法:
-  python baiqu_yanyu.py                       # 菜单选目标牌型
-  python baiqu_yanyu.py -p straight           # 顺子
-  python baiqu_yanyu.py -p 同花 -r 10          # 同花, 最多 10 轮
-  python baiqu_yanyu.py --check               # 只截图识别, 不点击
-  python baiqu_yanyu.py --image x.png         # 离线分析一张截图
+  python baiqu_yanyu.py                      # 菜单选目标牌型
+  python baiqu_yanyu.py -p 顺子               # 指定牌型
+  python baiqu_yanyu.py -p 同花 -r 20         # 最多 20 轮
+  python baiqu_yanyu.py --check              # 只截图识别, 不点击
+  python baiqu_yanyu.py --image x.png        # 离线分析一张截图
 """
 import argparse
 import ctypes
@@ -36,12 +39,12 @@ import time
 import unicodedata
 from ctypes import wintypes
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 from PIL import Image, ImageGrab
 
-__version__ = "1.1.5"
+__version__ = "1.2.0"
 
 if getattr(sys, "frozen", False):
     # PyInstaller onefile: 资源解压在 sys._MEIPASS
@@ -60,47 +63,37 @@ WINDOW_CLASS = "UnityWndClass"
 WINDOW_TITLE = "Endfield"
 
 HAND_SIZE = 5                  # 手牌张数
-
-# 搜索区(相对单张卡牌矩形): cx, cy, 半宽, 半高 —— 与原版 v1.0 一致, 模板在整个区内滑动
-RANK_ROI = (0.1104, 0.1250, 0.097, 0.100)     # 点数(16:9 / 16:10 都覆盖)
-SUIT_ROI = (0.2985, 0.1450, 0.080, 0.085)     # 花色(小字形, 16:9 / 16:10 都覆盖)
-
-REF_CARD_H = 452.0             # 模板截图里的卡牌高度(像素), 用来把模板换算到当前卡牌大小
-SCALES = (0.80, 0.90, 1.00, 1.10, 1.20)       # 原版的多尺度
-MATCH_MIN = 0.75               # 与模板的 NCC 下限
+MATCH_MIN = 0.70               # 模板匹配最低分
 MATCH_MARGIN = 0.05            # 第一名与第二名的差距下限
+REVEAL_WHITE = 0.20            # 卡牌"已翻开": 白色像素占比
+REVEAL_DARK = 0.03             # 同时要有深色笔画(防翻牌中途误判)
 
-# 单张卡牌应占窗口的比例(由 2560x1600 截图测得), 用来剔除错误的卡槽
+DRAW_WAIT = 3.0                # 点抽牌后等待翻牌
+CONFIRM_WAIT = 3.0             # 点放弃后等待弹窗
+RESET_WAIT = 8.0               # 点确认后等待回到抽牌界面
+CLICK_SETTLE = 0.05            # 点击间隔
+
+# 卡牌几何(相对单张卡牌): cx, cy, 半宽, 半高; 由 2560x1600 截图测量
+RANK_ROI = (0.1104, 0.1173, 0.115, 0.105)   # 点数搜索框
+SUIT_ROI = (0.2985, 0.1283, 0.090, 0.090)   # 花色搜索框
+REF_CARD_H = 452.0             # 模板采集时的卡牌高度(像素)
+SCALES = (0.80, 0.90, 1.00, 1.10, 1.20)     # 原版的多尺度
+SLOT_PITCH_RATIO = 1.0985      # 卡牌间距 / 卡牌宽度(16:10)
+
+# 单张卡牌应占窗口的比例, 用来剔掉错误的卡槽
 CARD_W_RANGE = (0.10, 0.17)
-CARD_H_RANGE = (0.21, 0.35)
-CARD_ASPECT = 452 / 335        # 16:10 卡牌 高/宽 (实测)
+CARD_H_RANGE = (0.21, 0.36)
 
-REVEAL_WHITE = 0.15            # 卡牌"已翻开"判定: 白色像素占比阈值
-REVEAL_DARK = 0.02             # 同时要有深色笔画, 防止翻牌中途误判
-
-DRAW_WAIT = 3.0                # 点抽牌后等待翻牌的时间
-CONFIRM_WAIT = 3.0             # 点放弃后等待弹窗的时间
-RESET_WAIT = 8.0               # 点确认后等待回到抽牌界面的时间
-CLICK_SETTLE = 0.05            # 两次点击之间的间隔
-UNKNOWN_GIVE_UP = 25           # 识别不确定连续多少帧后放弃本局
-
-SLOT_PITCH_RATIO = 1.0985      # 卡牌间距 / 卡牌宽度 (368/335)
-
-# 找不到 5 张青色卡背时的兜底位置(相对窗口)
-# 16:9 窗口(实测 1280x720): 卡面 x0=108/1280, y0=160/720, 宽166, 高250, 间距184
+# 16:10 与 16:9 的兜底卡槽(实测): x0, y0, w, h
+FALLBACK_1610 = [(0.0836, 0.2500, 0.1309, 0.2831),
+                 (0.2273, 0.2500, 0.1309, 0.2831),
+                 (0.3711, 0.2500, 0.1309, 0.2831),
+                 (0.5148, 0.2500, 0.1309, 0.2831),
+                 (0.6586, 0.2500, 0.1309, 0.2831)]
 FALLBACK_169 = [(0.0844 + i * 0.14375, 0.2222, 0.1300, 0.3472) for i in range(5)]
 
-FALLBACK_SLOTS = [
-    (0.0836, 0.2500, 0.1309, 0.2831),
-    (0.2273, 0.2500, 0.1309, 0.2831),
-    (0.3711, 0.2500, 0.1309, 0.2831),
-    (0.5148, 0.2500, 0.1309, 0.2831),
-    (0.6586, 0.2500, 0.1309, 0.2831),
-]
-
-# 按钮搜索区域与颜色(比例坐标), 数值来自 2560x1600 截图
+# 按钮搜索区域与颜色(比例坐标)
 BTN_SPECS = {
-    # name: (x0, y0, x1, y1, color, min_area_ratio)
     "draw":     (0.80, 0.66, 1.00, 0.90, "cyan",   0.0025),
     "abandon":  (0.56, 0.84, 0.84, 0.995, "red",    0.0015),
     "start":    (0.70, 0.895, 0.94, 0.995, "white", 0.0015),
@@ -111,11 +104,10 @@ SUITS = ("wan", "tiao", "tong")
 SUIT_CN = {"wan": "万", "tiao": "条", "tong": "筒"}
 RANKS = (1, 2, 3, 4, 5)
 
-# 目标牌型: key -> (中文名, 说明)
 PATTERNS = {
     "straight": ("顺子", "五张内出现四连(1-2-3-4 或 2-3-4-5)"),
-    "flush": ("同花", "抽到四张同花色即停"),
-    "straight_flush": ("同花顺", "五张同花色, 且点数恰好是 1-2-3-4-5"),
+    "flush": ("同花", "绝对同色, 凑到四张即停"),
+    "straight_flush": ("同花顺", "五张同花色, 且点数恰好 1-2-3-4-5"),
     "four": ("四条", "五张内有四张同点数(五条也算)"),
     "full_house": ("葫芦", "五张内 三张同点 + 两张同点"),
     "three": ("三条", "五张内有三张同点数"),
@@ -224,10 +216,7 @@ def _enum_windows():
 
 def find_game_window(want_class: str = WINDOW_CLASS,
                      want_title: str = WINDOW_TITLE):
-    """按 [类名+标题] -> [进程名 Endfield*.exe] -> [Unity 窗口] 打分找窗口。
-
-    最小化的游戏窗口也会被选中(随后会自动还原); 返回窗口信息 dict 或 None。
-    """
+    """按 [类名+标题] -> [进程名 Endfield*.exe] -> [Unity 窗口] 打分找窗口。"""
     best, best_key = None, (-1, -1)
     want_title_l = want_title.lower()
     for r in _enum_windows():
@@ -247,7 +236,6 @@ def find_game_window(want_class: str = WINDOW_CLASS,
             score += 20
         if score <= 0:
             continue
-        # 普通窗口优先; 最小化的窗口只有在强匹配(进程/类名+标题)时才要
         if (r["min"] or r["w"] < 640 or r["h"] < 360) and score < 70:
             continue
         key = (score, 0 if r["min"] else r["w"] * r["h"])
@@ -266,7 +254,6 @@ def print_window_hint(limit: int = 12):
         print(f"  hwnd={r['hwnd']:#x} {r['w']}x{r['h']}{flag} "
               f"exe={os.path.basename(r['exe'])!r} "
               f"class={r['cls']!r} title={r['title']!r}")
-    print("  (完整列表请运行: python tools/probe_windows.py)")
 
 
 def window_info(hwnd: int):
@@ -355,7 +342,7 @@ def click_norm(fx: float, fy: float) -> None:
     time.sleep(CLICK_SETTLE)
 
 
-# ---------------------------------------------------------------- 卡牌识别
+# ---------------------------------------------------------------- 图像分析
 
 @dataclass
 class Card:
@@ -406,6 +393,11 @@ def runs_of(mask1d: np.ndarray, min_len: int):
     return out
 
 
+def card_aspect(W: int, H: int) -> float:
+    """卡牌高/宽: 16:10 是 452/335, 16:9 的窗口里卡牌被拉得更高。"""
+    return 1.506 if W / H > 1.65 else 452 / 335
+
+
 def detect_teal_slots(img: Image.Image, a=None):
     """找青色卡背(未翻开的牌)。返回 Slot 列表(可能 0~5 个)。"""
     if a is None:
@@ -418,21 +410,19 @@ def detect_teal_slots(img: Image.Image, a=None):
     teal &= m
     cols = teal.sum(axis=0)
     thr = max(8, int(H * 0.02))
+    aspect = card_aspect(W, H)
     slots = []
     for x0, x1 in runs_of(cols > thr, min_len=max(10, int(W * 0.05))):
-        # 单张卡背宽度应约为窗口宽的 13%; 翻牌过程中相邻两张青色可能连成一片,
-        # 这种过宽的 run 必须丢掉, 否则会推出离谱的卡槽尺寸(逐像素搜索会卡死)
-        if not (CARD_W_RANGE[0] * W <= (x1 - x0 + 1) <= CARD_W_RANGE[1] * W):
+        w = int(x1) - int(x0) + 1
+        if not (CARD_W_RANGE[0] * W <= w <= CARD_W_RANGE[1] * W):
             continue
         sub = teal[:, x0:x1 + 1]
         rows = sub.sum(axis=1)
         ys = np.nonzero(rows > max(4, (x1 - x0) * 0.15))[0]
         if len(ys) < 20:
             continue
-        # 卡背底部有青色反光, 直接取 ys.max() 会把卡槽拉高; 按卡牌固定长宽比重算
+        # 卡背底部有青色反光, 直接取 ys.max() 会把卡槽拉高; 按固定长宽比重算
         top = int(ys.min())
-        w = int(x1) - int(x0) + 1
-        aspect = 1.506 if W / H > 1.65 else CARD_ASPECT   # 16:9 卡牌更高
         h = int(round(w * aspect))
         if not (CARD_H_RANGE[0] * H <= h <= CARD_H_RANGE[1] * H):
             continue
@@ -443,7 +433,7 @@ def detect_teal_slots(img: Image.Image, a=None):
 
 def fallback_slots(img: Image.Image):
     W, H = img.size
-    table = FALLBACK_169 if W / H > 1.65 else FALLBACK_SLOTS
+    table = FALLBACK_169 if W / H > 1.65 else FALLBACK_1610
     return [Slot(int(fx * W), int(fy * H),
                  int((fx + fw) * W), int((fy + fh) * H))
             for fx, fy, fw, fh in table]
@@ -455,55 +445,31 @@ def infer_slots(img: Image.Image, teal, prev_slots):
     if len(teal) == HAND_SIZE:
         return teal
     if len(teal) >= 1:
-        anchor = min(teal, key=lambda s: s.x0)
-        # 上一帧已经有准确卡槽(通常来自 5 张卡背那一帧) -> 只按位移平移, 别重新推间距
-        if prev_slots is not None and len(prev_slots) == HAND_SIZE:
-            idx0 = min(range(HAND_SIZE), key=lambda i: abs(prev_slots[i].x0 - anchor.x0))
-            ref = prev_slots[idx0]
-            # 翻牌动画里露出的青色区域大小/位置都会变, 尺寸不对就直接忽略, 守住旧卡槽
-            if not (0.85 * ref.w <= anchor.w <= 1.15 * ref.w):
-                return prev_slots
-            dx = anchor.x0 - ref.x0
-            dy = anchor.y0 - ref.y0
-            if abs(dx) <= W * 0.01 and abs(dy) <= H * 0.01:
-                return prev_slots
-            if abs(dx) <= W * 0.03 and abs(dy) <= H * 0.01:
-                return [Slot(s.x0 + dx, s.y0 + dy, s.x1 + dx, s.y1 + dy)
-                        for s in prev_slots]
-            return prev_slots
         w = float(np.median([s.w for s in teal]))
         y0 = int(np.median([s.y0 for s in teal]))
-        y1 = int(np.median([s.y1 for s in teal]))
+        h = int(np.median([s.h for s in teal]))
         pitch = w * SLOT_PITCH_RATIO
+        anchor = min(teal, key=lambda s: s.x0)
         fb = fallback_slots(img)
         idx = min(range(HAND_SIZE), key=lambda i: abs(fb[i].x0 - anchor.x0))
         x0 = anchor.x0 - idx * pitch
         if 0 <= x0 <= W * 0.92:
-            slots = []
-            for i in range(HAND_SIZE):
-                left = int(round(x0 + i * pitch))
-                slots.append(Slot(left, y0, int(round(left + w)), y1))
-            return slots
+            return [Slot(int(round(x0 + i * pitch)), y0,
+                         int(round(x0 + i * pitch + w)), y0 + h)
+                    for i in range(HAND_SIZE)]
     if prev_slots is not None and len(prev_slots) == HAND_SIZE:
         return prev_slots
     return fallback_slots(img)
 
 
-def box_of(s: Slot, spec) -> Tuple[int, int, int, int]:
-    """取样框(相对卡牌): cx, cy, 半宽, 半高 -> 像素坐标。"""
+def box_of(s: Slot, spec):
     cx, cy, hw, hh = spec
-    x0 = s.x0 + (cx - hw) * s.w
-    y0 = s.y0 + (cy - hh) * s.h
-    x1 = s.x0 + (cx + hw) * s.w
-    y1 = s.y0 + (cy + hh) * s.h
-    return int(round(x0)), int(round(y0)), int(round(x1)), int(round(y1))
+    return (int(round(s.x0 + (cx - hw) * s.w)), int(round(s.y0 + (cy - hh) * s.h)),
+            int(round(s.x0 + (cx + hw) * s.w)), int(round(s.y0 + (cy + hh) * s.h)))
 
 
 def is_revealed(a: np.ndarray, s: Slot) -> bool:
-    """卡牌左上角既要是白底, 又要有已渲染的深色点数/文字, 才算"翻开的牌"。
-
-    只看白底会把翻牌动画中途的空白牌面也算进去, 导致误判。
-    """
+    """卡牌左上角既要是白底, 又要有已渲染的深色点数/文字, 才算"翻开的牌"。"""
     x0, y0, x1, y1 = box_of(s, RANK_ROI)
     H, W = a.shape[:2]
     x0, x1 = max(0, x0), min(W, x1)
@@ -521,7 +487,6 @@ _TPL = {}
 
 
 def load_templates() -> Dict[str, Image.Image]:
-    """载入点数/花色模板(灰度)。"""
     if _TPL:
         return _TPL
     for r in RANKS:
@@ -537,126 +502,60 @@ def load_templates() -> Dict[str, Image.Image]:
     return _TPL
 
 
-def _match(patch: np.ndarray, tpl: Image.Image, size):
-    """模板缩放到取样尺寸后, 在 patch 内滑动取最高 NCC。
-
-    滑动窗口会自动吸收卡槽推算带来的几像素偏差(窗口化时 16:9/16:10 的间距差异),
-    不需要卡槽完全对准。
-    """
-    tw, th = size
-    if tw < 6 or th < 6 or tw > 240 or th > 240:
-        return 0.0, 0, 0
-    if patch.shape[0] < th + 1 or patch.shape[1] < tw + 1:
-        return 0.0, 0, 0
-    t = np.asarray(tpl.resize((tw, th), Image.LANCZOS), dtype=np.float32)
-    tz = t - float(t.mean())
-    tn = float(np.sqrt((tz * tz).sum())) + 1e-6
-
-    win = np.lib.stride_tricks.sliding_window_view(patch, (th, tw))
-    stride = 2 if max(win.shape[0], win.shape[1]) > 12 else 1
-    win = win[::stride, ::stride]
-    wc = win - win.mean(axis=(2, 3), keepdims=True)
-    den = np.sqrt((wc * wc).sum(axis=(2, 3))) * tn + 1e-6
-    sc = (wc * tz).sum(axis=(2, 3)) / den
-    k = np.unravel_index(int(np.argmax(sc)), sc.shape)
-    best = float(sc[k])
-    bx, by = int(k[1]) * stride, int(k[0]) * stride
-
-    if stride > 1:  # 粗搜步长 2, 再在最佳点 ±1 内细搜
-        for oy in range(max(0, by - 1), min(patch.shape[0] - th, by + 2) + 1):
-            for ox in range(max(0, bx - 1), min(patch.shape[1] - tw, bx + 2) + 1):
-                w2 = patch[oy:oy + th, ox:ox + tw]
-                a2 = w2 - float(w2.mean())
-                d2 = float(np.sqrt((a2 * a2).sum())) * tn + 1e-6
-                s2 = float((a2 * tz).sum() / d2)
-                if s2 > best:
-                    best, bx, by = s2, ox, oy
-    return max(best, 0.0), bx, by
-
-
-def _best(scores: Dict[str, float]) -> Tuple[Optional[str], float, float]:
-    """返回 (最佳键, 最佳分, 与次佳的差距)。"""
-    if not scores:
-        return None, 0.0, 0.0
-    ordered = sorted(scores.items(), key=lambda kv: -kv[1])
-    key, score = ordered[0]
-    margin = score - ordered[1][1] if len(ordered) > 1 else 1.0
-    return key, float(score), float(margin)
-
-
-def _score_template(patch, tpl, target_h, scales=SCALES) -> float:
-    """模板按 target_h 缩放, 在 patch 内滑动取最高 NCC(原版做法)。"""
+def match_tpl(patch: np.ndarray, tpl: Image.Image, target_h: float) -> float:
+    """模板按 target_h 缩放, 在取框内整幅滑动做 NCC, 取所有尺度里的最高分。"""
     ph, pw = patch.shape[:2]
+    if ph < 8 or pw < 8:
+        return 0.0
     best = 0.0
-    for f in scales:
+    for f in SCALES:
         th = int(round(target_h * f))
         tw = int(round(tpl.width * th / tpl.height))
-        if th < 6 or tw < 6 or th >= ph or tw >= pw:
+        if th < 8 or tw < 6 or th >= ph or tw >= pw:
             continue
-        best = max(best, _match(patch, tpl, (tw, th))[0])
+        t = np.asarray(tpl.resize((tw, th), Image.LANCZOS), dtype=np.float32)
+        tz = t - float(t.mean())
+        tn = float(np.sqrt((tz * tz).sum())) + 1e-6
+        win = np.lib.stride_tricks.sliding_window_view(patch, (th, tw))
+        wc = win - win.mean(axis=(2, 3), keepdims=True)
+        den = np.sqrt((wc * wc).sum(axis=(2, 3))) * tn + 1e-6
+        score = (wc * tz).sum(axis=(2, 3)) / den
+        best = max(best, float(score.max()))
     return best
 
 
+def best_of(scores: Dict[str, float]):
+    ordered = sorted(scores.items(), key=lambda kv: -kv[1])
+    key, sc = ordered[0]
+    margin = sc - ordered[1][1] if len(ordered) > 1 else 1.0
+    return key, float(sc), float(margin)
+
+
 def read_card(gray: np.ndarray, s: Slot) -> Card:
-    """读取一张已翻开的牌: 点数 + 花色, 认不准的项记为 None。"""
     H, W = gray.shape[:2]
     if not (CARD_W_RANGE[0] * W <= s.w <= CARD_W_RANGE[1] * W
             and CARD_H_RANGE[0] * H <= s.h <= CARD_H_RANGE[1] * H):
         return Card(None, None)
-
     tpl = load_templates()
-    rb = box_of(s, RANK_ROI)
-    rpatch = gray[max(0, rb[1]):min(H, rb[3]), max(0, rb[0]):min(W, rb[2])]
-    sb = box_of(s, SUIT_ROI)
-    spatch = gray[max(0, sb[1]):min(H, sb[3]), max(0, sb[0]):min(W, sb[2])]
+    x0, y0, x1, y1 = box_of(s, RANK_ROI)
+    rpatch = gray[max(0, y0):min(H, y1), max(0, x0):min(W, x1)]
+    x0, y0, x1, y1 = box_of(s, SUIT_ROI)
+    spatch = gray[max(0, y0):min(H, y1), max(0, x0):min(W, x1)]
 
-    rank_scores, suit_scores = {}, {}
+    rank_scores = {}
     for r in RANKS:
         t = tpl[f"r{r}"]
-        th = t.height / REF_CARD_H * s.h
-        # 先按原尺寸比一次, 分数已经够高就不再多尺度搜索
-        sc = _score_template(rpatch, t, th, (1.0,))
-        if sc < 0.82:
-            sc = max(sc, _score_template(rpatch, t, th))
-        rank_scores[str(r)] = sc
-    for s_ in SUITS:
-        t = tpl[f"s_{s_}"]
-        th = t.height / REF_CARD_H * s.h
-        sc = _score_template(spatch, t, th, (1.0,))
-        if sc < 0.82:
-            sc = max(sc, _score_template(spatch, t, th))
-        suit_scores[s_] = sc
+        rank_scores[str(r)] = match_tpl(rpatch, t, t.height / REF_CARD_H * s.h)
+    suit_scores = {}
+    for su in SUITS:
+        t = tpl[f"s_{su}"]
+        suit_scores[su] = match_tpl(spatch, t, t.height / REF_CARD_H * s.h)
 
-    rk, rs, rm = _best(rank_scores)
-    sk, ss, sm = _best(suit_scores)
-    rank = int(rk) if (rk and rs >= MATCH_MIN and rm >= MATCH_MARGIN) else None
-    suit = sk if (sk and ss >= MATCH_MIN and sm >= MATCH_MARGIN) else None
+    rk, rs, rm = best_of(rank_scores)
+    sk, ss, sm = best_of(suit_scores)
+    rank = int(rk) if rs >= MATCH_MIN and rm >= MATCH_MARGIN else None
+    suit = sk if ss >= MATCH_MIN and sm >= MATCH_MARGIN else None
     return Card(rank, suit, rs, ss)
-
-
-def analyze_slots(img: Image.Image, prev_slots=None, a=None, gray=None):
-    """返回 (slots, cards)。cards 只包含已翻开且识别成功的牌(按槽位顺序)。"""
-    if a is None:
-        a = np.asarray(img.convert("RGB")).astype(np.int16)
-    if gray is None:
-        gray = np.asarray(img.convert("L")).astype(np.float32)
-    teal = detect_teal_slots(img, a)
-    slots = infer_slots(img, teal, prev_slots)
-    cards = []
-    for s in slots:
-        s.revealed = is_revealed(a, s)
-        if not s.revealed:
-            s.card = None
-            continue
-        old_card = s.card
-        c = read_card(gray, s)
-        if not c.known and old_card is not None and old_card.known:
-            # 这张牌之前已经认准过, 别因为一帧抖动又变成"不确定"
-            c = old_card
-        s.card = c
-        if c is not None and c.known:
-            cards.append(c)
-    return slots, cards
 
 
 def color_mask(spec: str, a: np.ndarray) -> np.ndarray:
@@ -714,65 +613,41 @@ def has_straight4(cards: List[Card]) -> bool:
     return any(all(r in have for r in w) for w in STRAIGHT_WINDOWS)
 
 
-def has_flush4(cards: List[Card]) -> bool:
-    return bool(suit_counts(cards)) and max(suit_counts(cards).values()) >= 4
-
-
-def has_four(cards: List[Card]) -> bool:
-    return bool(rank_counts(cards)) and max(rank_counts(cards).values()) >= 4
-
-
-def has_full_house(cards: List[Card]) -> bool:
-    cs = sorted(rank_counts(cards).values(), reverse=True)
-    return len(cs) >= 2 and cs[0] >= 3 and cs[1] >= 2
-
-
-def has_three(cards: List[Card]) -> bool:
-    return bool(rank_counts(cards)) and max(rank_counts(cards).values()) >= 3
-
-
-def has_two_pair(cards: List[Card]) -> bool:
-    return sum(1 for v in rank_counts(cards).values() if v >= 2) >= 2
-
-
 def is_hit(cards: List[Card], target: str) -> bool:
-    """当前牌面是否已达成目标(包含语义: 更大的牌型也算)。"""
+    """当前牌面是否已经达成目标(包含语义: 更大的牌型也算)。"""
     if target == "flush":
-        # 绝对同色: 已抽的牌必须全是同一花色; 凑到 4 张即停
         return len(cards) >= 4 and len(suit_counts(cards)) == 1
     if len(cards) < HAND_SIZE:
         return False
+    rc = rank_counts(cards)
+    cs = sorted(rc.values(), reverse=True)
     if target == "straight":
         return has_straight4(cards)
     if target == "straight_flush":
-        # 五张同花色 + 点数恰好 1-2-3-4-5(五张顺子)
-        return (len(suit_counts(cards)) == 1
-                and set(rank_counts(cards)) == {1, 2, 3, 4, 5})
+        return len(suit_counts(cards)) == 1 and set(rc) == {1, 2, 3, 4, 5}
     if target == "four":
-        return has_four(cards)
+        return cs[0] >= 4
     if target == "full_house":
-        return has_full_house(cards)
+        return len(cs) >= 2 and cs[0] >= 3 and cs[1] >= 2
     if target == "three":
-        return has_three(cards)
+        return cs[0] >= 3
     if target == "two_pair":
-        return has_two_pair(cards)
-    raise ValueError(f"未知牌型: {target}")
+        return sum(1 for v in cs if v >= 2) >= 2
+    raise ValueError(target)
 
 
 def can_complete(cards: List[Card], target: str) -> bool:
-    """手牌不变的前提下, 后面的空位是否还有可能凑成目标(保守: 不看牌库剩余)。"""
+    """剩下的空位是否还有可能凑成目标(保守: 不看牌库剩余)。"""
     if is_hit(cards, target):
         return True
     rem = HAND_SIZE - len(cards)
     if rem <= 0:
         return False
     rc = rank_counts(cards)
-    max_rank = max(rc.values()) if rc else 0
     sc = suit_counts(cards)
-    max_suit = max(sc.values()) if sc else 0
+    max_rank = max(rc.values()) if rc else 0
 
     if target == "flush":
-        # 绝对同色: 已经出现第二种花色就不可能
         if len(sc) > 1:
             return False
         return sum(sc.values()) + rem >= 4
@@ -781,10 +656,7 @@ def can_complete(cards: List[Card], target: str) -> bool:
         return any(len([r for r in w if r not in have]) <= rem
                    for w in STRAIGHT_WINDOWS)
     if target == "straight_flush":
-        # 五张同花色 + 恰好 1-5 各一张: 花色不齐或出现重复点数都不可能
-        if len(sc) > 1:
-            return False
-        if any(v > 1 for v in rc.values()):
+        if len(sc) > 1 or any(v > 1 for v in rc.values()):
             return False
         return len({1, 2, 3, 4, 5} - set(rc)) <= rem
     if target == "four":
@@ -798,10 +670,7 @@ def can_complete(cards: List[Card], target: str) -> bool:
             if need3 > rem:
                 continue
             for q in ranks:
-                if q == r:
-                    continue
-                need2 = max(0, 2 - rc.get(q, 0))
-                if need3 + need2 <= rem:
+                if q != r and need3 + max(0, 2 - rc.get(q, 0)) <= rem:
                     return True
         return False
     if target == "two_pair":
@@ -810,15 +679,12 @@ def can_complete(cards: List[Card], target: str) -> bool:
         if pairs >= 2:
             return True
         if pairs == 1:
-            need = 1 if singles > 0 else 2
-            return need <= rem
-        need = 2 if singles >= 2 else (3 if singles == 1 else 4)
-        return need <= rem
-    raise ValueError(f"未知牌型: {target}")
+            return (1 if singles else 2) <= rem
+        return (2 if singles >= 2 else (3 if singles == 1 else 4)) <= rem
+    raise ValueError(target)
 
 
 def decide(cards: List[Card], target: str) -> str:
-    """返回 stop(已达成) / abandon(不可能) / draw(继续抽)。"""
     if is_hit(cards, target):
         return "stop"
     if not can_complete(cards, target):
@@ -831,7 +697,6 @@ def fmt_cards(cards: List[Card]) -> str:
 
 
 def _disp_width(text: str) -> int:
-    """终端显示宽度(中文按 2 列算)。"""
     return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
 
 
@@ -841,16 +706,6 @@ def pad(text: str, width: int) -> str:
 
 # ---------------------------------------------------------------- 状态与动作
 
-def save_dump(img: Image.Image, tag: str) -> None:
-    """出错时自动把脚本看到的画面存下来, 方便排查(不会影响游戏)。"""
-    try:
-        name = f"shot_{tag}_{time.strftime('%H%M%S')}.png"
-        img.save(name)
-        print(f"    已保存当时的画面: {os.path.abspath(name)}")
-    except Exception as e:  # noqa: BLE001
-        print(f"    保存截图失败: {e}")
-
-
 @dataclass
 class Frame:
     slots: list
@@ -858,7 +713,23 @@ class Frame:
     revealed: int
     buttons: dict = field(default_factory=dict)
     unknown: int = 0
-    overlay: float = 0.0     # 手牌区域被别的窗口遮住的黑色占比
+    overlay: float = 0.0
+
+
+def analyze_slots(img: Image.Image, prev_slots=None, a=None, gray=None):
+    if a is None:
+        a = np.asarray(img.convert("RGB")).astype(np.int16)
+    if gray is None:
+        gray = np.asarray(img.convert("L")).astype(np.float32)
+    teal = detect_teal_slots(img, a)
+    slots = infer_slots(img, teal, prev_slots)
+    cards = []
+    for s in slots:
+        s.revealed = is_revealed(a, s)
+        s.card = read_card(gray, s) if s.revealed else None
+        if s.revealed and s.card is not None and s.card.known:
+            cards.append(s.card)
+    return slots, cards
 
 
 def overlay_ratio(a: np.ndarray, slots) -> float:
@@ -866,17 +737,14 @@ def overlay_ratio(a: np.ndarray, slots) -> float:
     if not slots:
         return 0.0
     H, W = a.shape[:2]
-    x0 = min(s.x0 for s in slots)
-    x1 = max(s.x1 for s in slots)
-    y0 = min(s.y0 for s in slots)
-    y1 = max(s.y1 for s in slots)
-    x0, x1 = max(0, x0), min(W, x1)
-    y0, y1 = max(0, y0), min(H, y1)
+    x0 = max(0, min(s.x0 for s in slots))
+    x1 = min(W, max(s.x1 for s in slots))
+    y0 = max(0, min(s.y0 for s in slots))
+    y1 = min(H, max(s.y1 for s in slots))
     if x1 - x0 < 10 or y1 - y0 < 10:
         return 0.0
     p = a[y0:y1, x0:x1]
-    dark = (p[..., 0] < 35) & (p[..., 1] < 35) & (p[..., 2] < 35)
-    return float(dark.mean())
+    return float(((p[..., 0] < 35) & (p[..., 1] < 35) & (p[..., 2] < 35)).mean())
 
 
 def inspect(img: Image.Image, prev_slots=None, with_start: bool = False) -> Frame:
@@ -892,7 +760,6 @@ def inspect(img: Image.Image, prev_slots=None, with_start: bool = False) -> Fram
 
 
 def wait_frame(grabber, pred, timeout, prev_slots=None, interval=0.06):
-    """轮询截图直到 pred(Frame) 为真; 返回 (Frame, True) 或 (最后一帧, False)。"""
     end = time.time() + timeout
     last = None
     while time.time() < end:
@@ -907,7 +774,6 @@ def wait_frame(grabber, pred, timeout, prev_slots=None, interval=0.06):
 # ---------------------------------------------------------------- 主流程
 
 def cmd_check(img: Image.Image):
-    load_templates()
     fr = inspect(img, with_start=True)
     print(f"窗口图像: {img.size[0]}x{img.size[1]}")
     print(f"识别到卡槽: {len(fr.slots)}")
@@ -919,11 +785,8 @@ def cmd_check(img: Image.Image):
             print(f"  #{i+1} 未翻开/无法识别")
     print(f"已翻开: {fr.revealed}  识别成功: {len(fr.cards)}  -> {fmt_cards(fr.cards)}")
     if fr.overlay > 0.25:
-        print(f"[!] 手牌区域有 {fr.overlay*100:.0f}% 被其它窗口遮住, 识别结果不可信; "
-              f"请把控制台/其它窗口移开游戏画面后再试。")
-    for name, (cn, _desc) in PATTERNS.items():
-        print(f"  {pad(cn, 6)} {'可达成' if can_complete(fr.cards, name) else '不可能'}"
-              f" / {'已达成' if is_hit(fr.cards, name) else '-'}")
+        print(f"[!] 手牌区域有 {fr.overlay*100:.0f}% 被其它窗口遮住, 结果不可信; "
+              f"请把控制台移开游戏画面。")
     for k, v in fr.buttons.items():
         print(f"按钮 {k}: {'(%.3f, %.3f)' % v if v else '未找到'}")
     return fr
@@ -999,41 +862,6 @@ def live(args) -> int:
             print(f"[!] {e}")
             return False
 
-    state = {"abandons": 0}
-
-    def abandon_round(reason: str) -> bool:
-        """放弃当前这一局并确认, 等到重新回到抽牌界面。失败返回 False。"""
-        fr_a = inspect(snap())
-        pos = fr_a.buttons.get("abandon")
-        if not pos:
-            print(f"[!] {reason}, 但没找到「放弃挑战」按钮。")
-            return False
-        print(f"[轮 {round_no:>3}] 放弃: {reason}")
-        if not safe_click(pos):
-            return False
-        fr_b, ok = wait_frame(snap, lambda f_: f_.buttons.get("confirm") is not None,
-                              CONFIRM_WAIT)
-        if not ok:
-            print("[!] 放弃确认弹窗没出现, 重试一次")
-            if not safe_click(pos):
-                return False
-            fr_b, ok = wait_frame(snap, lambda f_: f_.buttons.get("confirm") is not None,
-                                  CONFIRM_WAIT)
-            if not ok:
-                print("[!] 放弃弹窗仍未出现。")
-                return False
-        if not safe_click(fr_b.buttons["confirm"]):
-            return False
-        state["abandons"] += 1
-        _, ok = wait_frame(
-            snap,
-            lambda f_: f_.revealed == 0 and f_.buttons.get("draw") is not None,
-            RESET_WAIT)
-        if not ok:
-            print("[!] 确认后没有回到抽牌界面。")
-            return False
-        return True
-
     shot = snap()
     fr = inspect(shot)
     print(f"初始: 手牌 {fr.revealed}/{HAND_SIZE} -> {fmt_cards(fr.cards)}")
@@ -1050,23 +878,17 @@ def live(args) -> int:
 
     t_start = time.time()
     round_no = 0
-
-    # 开局桌上已经有牌也没关系, 直接接着判断/抽牌, 不主动放弃
-    if fr.revealed > 0:
-        print(f"开局已有 {fr.revealed} 张手牌, 接着判断")
+    abandons = 0
+    overlay_warned = 0.0
 
     while True:
         round_no += 1
         if args.rounds and round_no > args.rounds:
             break
         prev_slots = None
-        prev_cards: List[Card] = []
         stalls = 0
         no_draw = 0
-        unknown_streak = 0
         last_draw_t = 0.0
-        printed_n = -1
-        debug_n = -1
 
         while True:
             if user32.GetForegroundWindow() != hwnd:
@@ -1075,12 +897,11 @@ def live(args) -> int:
             fr = inspect(snap(), prev_slots)
             prev_slots = fr.slots
             if fr.overlay > 0.25:
-                # 手牌区域被别的窗口(常见是控制台)挡住, 这时候识别结果不可信, 等它让开
                 now = time.time()
-                if now - state.get("overlay_warn", 0) > 3:
-                    state["overlay_warn"] = now
+                if now - overlay_warned > 3:
+                    overlay_warned = now
                     print(f"[!] 手牌区域有 {fr.overlay*100:.0f}% 被其它窗口遮住, "
-                          f"识别暂停。请把控制台/其它窗口移开游戏画面。")
+                          f"识别暂停; 请把控制台移开游戏画面。")
                 time.sleep(0.5)
                 continue
             if fr.buttons.get("confirm"):
@@ -1089,49 +910,8 @@ def live(args) -> int:
                 time.sleep(0.8)
                 continue
 
-            if fr.unknown:
-                unknown_streak += 1
-                if unknown_streak > UNKNOWN_GIVE_UP:
-                    for i, s in enumerate(fr.slots):
-                        if s.revealed and (s.card is None or not s.card.known):
-                            print(f"    [!] 槽位 #{i+1} 认不准 "
-                                  f"(点数 {s.card.rank_score if s.card else 0:.2f} / "
-                                  f"花色 {s.card.suit_score if s.card else 0:.2f})")
-                    print(f"[轮 {round_no:>3}] 有 {fr.unknown} 张牌识别不确定 -> 放弃本局重抽")
-                    if not abandon_round("识别不确定"):
-                        save_dump(snap(), "unknown")
-                        return 6
-                    break
-                time.sleep(0.12)
-                continue
-            unknown_streak = 0
-
-            # 新翻开的牌再复检一次, 两次读数一致才采信(防翻牌动画期间的误识别)
-            if len(fr.cards) > len(prev_cards):
-                sig = tuple((c.rank, c.suit) for c in fr.cards)
-                time.sleep(0.12)
-                fr2 = inspect(snap(), fr.slots)
-                prev_slots = fr2.slots
-                if fr2.unknown or tuple((c.rank, c.suit) for c in fr2.cards) != sig:
-                    time.sleep(0.06)
-                    continue
-                fr = fr2
-
-            # 同一轮内牌只增不减: 识别抖动时沿用上一帧结果
-            if len(fr.cards) >= len(prev_cards):
-                cards = fr.cards
-                prev_cards = cards
-            else:
-                cards = prev_cards
-
+            cards = fr.cards
             n = len(cards)
-            if args.debug and n != debug_n:
-                debug_n = n
-                detail = " ".join(
-                    f"#{i+1}:{s.card}({s.card.rank_score:.2f}/{s.card.suit_score:.2f})"
-                    for i, s in enumerate(fr.slots)
-                    if s.revealed and s.card is not None)
-                print(f"      [调试] {detail}")
             action = decide(cards, target)
 
             if action == "stop":
@@ -1139,54 +919,72 @@ def live(args) -> int:
                 cost = time.time() - t_start
                 print(f"[命中] 第 {round_no} 轮  {n}/{HAND_SIZE}  {fmt_cards(cards)}")
                 print(f"       牌型 {pat_cn} 达成; 用时 {cost/60:.1f} 分钟, "
-                      f"共 {round_no} 轮, 放弃 {state['abandons']} 次。")
+                      f"共 {round_no} 轮, 放弃 {abandons} 次。")
                 print("       已停手, 手牌保留; 需要你自己点「开始挑战」。")
                 return 0
 
             if action == "abandon":
-                if n >= HAND_SIZE:
-                    reason = f"抽满 5 张仍未达成{pat_cn}"
-                else:
-                    reason = f"已抽 {n} 张, {pat_cn}已不可能"
-                # 放弃是不可逆操作: 多给一点时间复查(翻牌动画/识别抖动), 确认后才放弃
+                # 放弃不可逆: 多等一会复查, 防止翻牌动画/识别抖动误判
+                reason = (f"抽满 5 张仍未达成{pat_cn}" if n >= HAND_SIZE
+                          else f"已抽 {n} 张, {pat_cn}已不可能")
                 reverted = False
                 for _ in range(3):
                     time.sleep(0.30)
                     fr2 = inspect(snap(), prev_slots)
                     prev_slots = fr2.slots
-                    if fr2.unknown or len(fr2.cards) < len(cards):
+                    if fr2.overlay > 0.25 or fr2.unknown:
                         continue
-                    if decide(fr2.cards, target) != "abandon":
-                        print(f"[~] 复查后放弃条件不成立({fmt_cards(fr2.cards)}), 继续")
-                        prev_cards = fr2.cards
+                    if fr2.cards and decide(fr2.cards, target) != "abandon":
+                        print(f"[~] 复查后不放弃({fmt_cards(fr2.cards)}), 继续")
                         reverted = True
                         break
                 if reverted:
                     continue
-                print(f"[轮 {round_no:>3}] {n}/{HAND_SIZE}  {pad(fmt_cards(cards), 26)} "
-                      f"-> {reason}")
-                if not abandon_round(reason):
-                    save_dump(snap(), "abandon")
-                    return 7
-                break  # 进入下一轮
 
-            # 继续抽一张
+                pos = fr.buttons.get("abandon")
+                if not pos:
+                    print("[!] 该放弃但没找到「放弃挑战」按钮, 停止。")
+                    return 7
+                print(f"[轮 {round_no:>3}] {n}/{HAND_SIZE}  {pad(fmt_cards(cards), 26)} "
+                      f"-> 放弃: {reason}")
+                if not safe_click(pos):
+                    return 3
+                fr2, ok = wait_frame(snap, lambda f_: f_.buttons.get("confirm") is not None,
+                                     CONFIRM_WAIT, prev_slots)
+                if not ok:
+                    print("[!] 放弃确认弹窗没出现, 重试一次")
+                    if not safe_click(pos):
+                        return 3
+                    fr2, ok = wait_frame(snap, lambda f_: f_.buttons.get("confirm") is not None,
+                                         CONFIRM_WAIT, prev_slots)
+                    if not ok:
+                        print("[!] 放弃弹窗仍未出现, 停止。")
+                        return 8
+                if not safe_click(fr2.buttons["confirm"]):
+                    return 3
+                abandons += 1
+                _, ok = wait_frame(
+                    snap,
+                    lambda f_: f_.revealed == 0 and f_.buttons.get("draw") is not None,
+                    RESET_WAIT, prev_slots)
+                if not ok:
+                    print("[!] 确认后没有回到抽牌界面, 停止。")
+                    return 9
+                break
+
             pos = fr.buttons.get("draw")
             if not pos:
                 no_draw += 1
                 if no_draw > 25:
                     print(f"[!] 没找到可用的抽牌按钮 (已翻开 {fr.revealed}/{HAND_SIZE})")
-                    print("    可能原因: 牌库为空 / 不在抽牌界面 / 分辨率或 UI 缩放不匹配。")
-                    if abandon_round("抽牌按钮不可用"):
-                        break
-                    save_dump(snap(), "nodraw")
+                    print("    可能原因: 牌库为空 / 不在抽牌界面 / 窗口被挡住。")
                     return 4
                 time.sleep(0.12)
                 continue
             no_draw = 0
-            if n != printed_n:
-                print(f"[轮 {round_no:>3}] {n}/{HAND_SIZE}  {pad(fmt_cards(cards), 26)} -> 继续")
-                printed_n = n
+            gap = (time.perf_counter() - last_draw_t) if last_draw_t else 0.0
+            print(f"[轮 {round_no:>3}] {n}/{HAND_SIZE}  {pad(fmt_cards(cards), 26)} -> 继续"
+                  + (f" (上一抽 {gap:.1f}s)" if gap else ""))
             before = fr.revealed
             if not safe_click(pos):
                 return 3
@@ -1205,9 +1003,8 @@ def live(args) -> int:
                     break
                 if fr2.revealed > before:
                     got_new = True
-                    time.sleep(0.12)  # 等卡面/点数渲染稳定
+                    time.sleep(0.12)
                     break
-                # 点击可能没被接收(按钮还在动画/置灰): 按钮仍可见就补点一次
                 p2 = fr2.buttons.get("draw")
                 if p2 and (time.perf_counter() - last_click) >= 0.7:
                     if not safe_click(p2):
@@ -1219,10 +1016,7 @@ def live(args) -> int:
                 stalls += 1
                 print(f"[!] 抽牌后未检测到新翻开的牌 (重试 {stalls}/3)")
                 if stalls >= 3:
-                    print("[!] 连续 3 次抽牌无反应")
-                    if abandon_round("抽牌无响应"):
-                        break
-                    save_dump(snap(), "stall")
+                    print("连续 3 次抽牌无反应, 停止。")
                     return 5
 
     print(f"达到设定轮数 {args.rounds}, 仍未达成{pat_cn}, 停止。")
@@ -1242,9 +1036,7 @@ def main():
                     help="最多跑多少轮, 0=无限制(默认)")
     ap.add_argument("--hwnd", type=lambda s: int(s, 0),
                     help="手动指定窗口句柄(如 0x123456)")
-    ap.add_argument("--debug", action="store_true", help="打印每张牌的识别分数")
-    ap.add_argument("--dump", metavar="PATH",
-                    help="把脚本看到的窗口画面存成 PNG(排查识别问题用)")
+    ap.add_argument("--dump", metavar="PATH", help="把脚本看到的画面存成 PNG")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args()
 
@@ -1265,7 +1057,6 @@ def main():
             return 2
         args.pattern = key
     elif args.check:
-        # --check 只看识别结果, 不需要目标牌型
         args.pattern = PATTERN_ORDER[0]
     else:
         args.pattern = choose_pattern()
