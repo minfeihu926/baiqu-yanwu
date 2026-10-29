@@ -1084,6 +1084,9 @@ def main():
             print("可选: " + " / ".join(f"{k}({PATTERNS[k][0]})" for k in PATTERN_ORDER))
             return 2
         args.pattern = key
+    elif args.check:
+        # --check 只看识别结果, 不需要目标牌型
+        args.pattern = PATTERN_ORDER[0]
     else:
         args.pattern = choose_pattern()
 

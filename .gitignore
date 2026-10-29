@@ -30,3 +30,8 @@ vendor/
 
 # 本地分析/测试截图
 analysis/
+
+# 本地打包工具链
+.build-tools/
+.wheels/
+build/
