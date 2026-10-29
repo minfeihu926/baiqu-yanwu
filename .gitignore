@@ -35,3 +35,6 @@ analysis/
 .build-tools/
 .wheels/
 build/
+
+# 运行时自动保存的排查截图
+shot_*.png
