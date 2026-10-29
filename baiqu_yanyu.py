@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 百趣演武 · 自动抽牌(第一轮)
@@ -44,7 +44,7 @@ from typing import Dict, List, Optional
 import numpy as np
 from PIL import Image, ImageGrab
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 if getattr(sys, "frozen", False):
     # PyInstaller onefile: 资源解压在 sys._MEIPASS
@@ -713,7 +713,6 @@ class Frame:
     revealed: int
     buttons: dict = field(default_factory=dict)
     unknown: int = 0
-    overlay: float = 0.0
 
 
 def analyze_slots(img: Image.Image, prev_slots=None, a=None, gray=None):
@@ -732,21 +731,6 @@ def analyze_slots(img: Image.Image, prev_slots=None, a=None, gray=None):
     return slots, cards
 
 
-def overlay_ratio(a: np.ndarray, slots) -> float:
-    """手牌区域里"几乎纯黑"的占比: 控制台/其它窗口挡在游戏前面时会很高。"""
-    if not slots:
-        return 0.0
-    H, W = a.shape[:2]
-    x0 = max(0, min(s.x0 for s in slots))
-    x1 = min(W, max(s.x1 for s in slots))
-    y0 = max(0, min(s.y0 for s in slots))
-    y1 = min(H, max(s.y1 for s in slots))
-    if x1 - x0 < 10 or y1 - y0 < 10:
-        return 0.0
-    p = a[y0:y1, x0:x1]
-    return float(((p[..., 0] < 35) & (p[..., 1] < 35) & (p[..., 2] < 35)).mean())
-
-
 def inspect(img: Image.Image, prev_slots=None, with_start: bool = False) -> Frame:
     a = np.asarray(img.convert("RGB")).astype(np.int16)
     gray = np.asarray(img.convert("L")).astype(np.float32)
@@ -755,8 +739,7 @@ def inspect(img: Image.Image, prev_slots=None, with_start: bool = False) -> Fram
     names = ("draw", "abandon", "confirm") + (("start",) if with_start else ())
     buttons = {name: find_button(a, name) for name in names}
     return Frame(slots, cards, revealed, buttons,
-                 unknown=max(0, revealed - len(cards)),
-                 overlay=overlay_ratio(a, slots))
+                 unknown=max(0, revealed - len(cards)))
 
 
 def wait_frame(grabber, pred, timeout, prev_slots=None, interval=0.06):
@@ -784,9 +767,6 @@ def cmd_check(img: Image.Image):
         else:
             print(f"  #{i+1} 未翻开/无法识别")
     print(f"已翻开: {fr.revealed}  识别成功: {len(fr.cards)}  -> {fmt_cards(fr.cards)}")
-    if fr.overlay > 0.25:
-        print(f"[!] 手牌区域有 {fr.overlay*100:.0f}% 被其它窗口遮住, 结果不可信; "
-              f"请把控制台移开游戏画面。")
     for k, v in fr.buttons.items():
         print(f"按钮 {k}: {'(%.3f, %.3f)' % v if v else '未找到'}")
     return fr
@@ -862,6 +842,36 @@ def live(args) -> int:
             print(f"[!] {e}")
             return False
 
+    def do_abandon(fr):
+        """放弃挑战 -> 确认 -> 等回到抽牌界面。返回 (成功?, 返回码)。"""
+        pos = fr.buttons.get("abandon")
+        if not pos:
+            print("[!] 没找到「放弃挑战」按钮, 停止。")
+            return False, 7
+        if not safe_click(pos):
+            return False, 3
+        fr2, ok = wait_frame(snap, lambda f_: f_.buttons.get("confirm") is not None,
+                             CONFIRM_WAIT)
+        if not ok:
+            print("[!] 放弃确认弹窗没出现, 重试一次")
+            if not safe_click(pos):
+                return False, 3
+            fr2, ok = wait_frame(snap, lambda f_: f_.buttons.get("confirm") is not None,
+                                 CONFIRM_WAIT)
+            if not ok:
+                print("[!] 放弃弹窗仍未出现, 停止。")
+                return False, 8
+        if not safe_click(fr2.buttons["confirm"]):
+            return False, 3
+        _, ok = wait_frame(
+            snap,
+            lambda f_: f_.revealed == 0 and f_.buttons.get("draw") is not None,
+            RESET_WAIT)
+        if not ok:
+            print("[!] 确认后没有回到抽牌界面, 停止。")
+            return False, 9
+        return True, 0
+
     shot = snap()
     fr = inspect(shot)
     print(f"初始: 手牌 {fr.revealed}/{HAND_SIZE} -> {fmt_cards(fr.cards)}")
@@ -879,7 +889,6 @@ def live(args) -> int:
     t_start = time.time()
     round_no = 0
     abandons = 0
-    overlay_warned = 0.0
 
     while True:
         round_no += 1
@@ -896,14 +905,6 @@ def live(args) -> int:
                 return 3
             fr = inspect(snap(), prev_slots)
             prev_slots = fr.slots
-            if fr.overlay > 0.25:
-                now = time.time()
-                if now - overlay_warned > 3:
-                    overlay_warned = now
-                    print(f"[!] 手牌区域有 {fr.overlay*100:.0f}% 被其它窗口遮住, "
-                          f"识别暂停; 请把控制台移开游戏画面。")
-                time.sleep(0.5)
-                continue
             if fr.buttons.get("confirm"):
                 if not safe_click(fr.buttons["confirm"]):
                     return 3
@@ -924,56 +925,33 @@ def live(args) -> int:
                 return 0
 
             if action == "abandon":
-                # 放弃不可逆: 多等一会复查, 防止翻牌动画/识别抖动误判
+                # 放弃不可逆: 先复查一帧, 防止翻牌动画/识别抖动误判
                 reason = (f"抽满 5 张仍未达成{pat_cn}" if n >= HAND_SIZE
                           else f"已抽 {n} 张, {pat_cn}已不可能")
-                reverted = False
-                for _ in range(3):
-                    time.sleep(0.30)
-                    fr2 = inspect(snap(), prev_slots)
-                    prev_slots = fr2.slots
-                    if fr2.overlay > 0.25 or fr2.unknown:
-                        continue
-                    if fr2.cards and decide(fr2.cards, target) != "abandon":
-                        print(f"[~] 复查后不放弃({fmt_cards(fr2.cards)}), 继续")
-                        reverted = True
-                        break
-                if reverted:
+                time.sleep(0.20)
+                fr2 = inspect(snap(), prev_slots)
+                prev_slots = fr2.slots
+                if fr2.cards and decide(fr2.cards, target) != "abandon":
+                    print(f"[~] 复查后不放弃({fmt_cards(fr2.cards)}), 继续")
                     continue
-
-                pos = fr.buttons.get("abandon")
-                if not pos:
-                    print("[!] 该放弃但没找到「放弃挑战」按钮, 停止。")
-                    return 7
                 print(f"[轮 {round_no:>3}] {n}/{HAND_SIZE}  {pad(fmt_cards(cards), 26)} "
                       f"-> 放弃: {reason}")
-                if not safe_click(pos):
-                    return 3
-                fr2, ok = wait_frame(snap, lambda f_: f_.buttons.get("confirm") is not None,
-                                     CONFIRM_WAIT, prev_slots)
+                ok, code = do_abandon(fr)
                 if not ok:
-                    print("[!] 放弃确认弹窗没出现, 重试一次")
-                    if not safe_click(pos):
-                        return 3
-                    fr2, ok = wait_frame(snap, lambda f_: f_.buttons.get("confirm") is not None,
-                                         CONFIRM_WAIT, prev_slots)
-                    if not ok:
-                        print("[!] 放弃弹窗仍未出现, 停止。")
-                        return 8
-                if not safe_click(fr2.buttons["confirm"]):
-                    return 3
+                    return code
                 abandons += 1
-                _, ok = wait_frame(
-                    snap,
-                    lambda f_: f_.revealed == 0 and f_.buttons.get("draw") is not None,
-                    RESET_WAIT, prev_slots)
-                if not ok:
-                    print("[!] 确认后没有回到抽牌界面, 停止。")
-                    return 9
                 break
 
             pos = fr.buttons.get("draw")
             if not pos:
+                if fr.revealed >= HAND_SIZE:
+                    # 手牌已经满了, 抽牌按钮当然没有了; 有牌没认出来就放弃重抽
+                    print(f"[轮 {round_no:>3}] 手牌已满但只认出 {len(cards)} 张 -> 放弃重抽")
+                    ok, code = do_abandon(fr)
+                    if not ok:
+                        return code
+                    abandons += 1
+                    break
                 no_draw += 1
                 if no_draw > 25:
                     print(f"[!] 没找到可用的抽牌按钮 (已翻开 {fr.revealed}/{HAND_SIZE})")
