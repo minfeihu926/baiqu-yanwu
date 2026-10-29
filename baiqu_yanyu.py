@@ -3,41 +3,52 @@
 """
 百趣演武 · 自动抽牌(第一轮)
 
-逻辑(一张一张抽):
-  - 抽到第 n 张时统计点数 5 的个数 f;
-  - 若 f < n-1(剩下 5-n 个位置全出 5 也凑不够 4 张), 立即「放弃挑战」→「确认」→ 重抽;
-  - 抽满 5 张且 f >= 4 -> 停手, 手牌保留给你, 脚本退出;
-  - 抽满 5 张仍不足 4 张 -> 放弃重抽。
-不点「开始挑战」, 不参与战斗。
-目标窗口: 终末地, 窗口化(1280x720 / 1280x800 均可), 运行时必须在前台。
+每张牌识别 点数(1-5) + 花色(万/条/筒), 按你选的目标牌型判断:
 
+  顺子      抽满 5 张, 其中出现四连(1-2-3-4 或 2-3-4-5)即中
+  同花      抽到 4 张同花色即停(不必抽满 5 张)
+  同花顺    抽满 5 张, 五张同花色且出现四连
+  四条      抽满 5 张, 有 4 张同点数(五条也算)
+  葫芦      抽满 5 张, 3 张同点 + 2 张同点
+  三条      抽满 5 张, 有 3 张同点数
+  两对      抽满 5 张, 两个不同点数各至少 2 张
+
+中途只要判定"目标已不可能", 立即「放弃挑战」→「确认」→ 重抽;
+凑成目标则停手、打印结果、脚本退出(不点「开始挑战」)。
+轮数默认无上限, 随时 Ctrl+C 结束。
+
+目标窗口: 终末地, 窗口模式, 运行时必须在前台。
 依赖: numpy, pillow
 许可证: MIT
 
 用法:
-  python baiqu_yanyu.py --check            # 只截图识别, 不点击(首次建议)
-  python baiqu_yanyu.py                    # 正式运行
-  python baiqu_yanyu.py --image x.png --check   # 离线分析一张截图
+  python baiqu_yanyu.py                       # 菜单选目标牌型
+  python baiqu_yanyu.py -p straight           # 顺子
+  python baiqu_yanyu.py -p 同花 -r 10          # 同花, 最多 10 轮
+  python baiqu_yanyu.py --check               # 只截图识别, 不点击
+  python baiqu_yanyu.py --image x.png         # 离线分析一张截图
 """
 import argparse
 import ctypes
 import os
 import sys
 import time
+import unicodedata
 from ctypes import wintypes
 from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image, ImageGrab
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 if getattr(sys, "frozen", False):
     # PyInstaller onefile: 资源解压在 sys._MEIPASS
     BASE = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
 else:
     BASE = os.path.dirname(os.path.abspath(__file__))
-TEMPLATE_FIVE = os.path.join(BASE, "templates", "digit5.png")
+TPL_DIR = os.path.join(BASE, "templates")
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -48,21 +59,25 @@ advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
 WINDOW_CLASS = "UnityWndClass"
 WINDOW_TITLE = "Endfield"
 
-HAND_SIZE = 5          # 手牌张数
-DIGIT_FIVE_THRESHOLD = 0.75   # 数字 5 模板匹配阈值(0~1)
-FIVE_BOX_MEAN = 0.25   # 卡牌"已翻开"判定: 左上角白色像素占比阈值
-MAX_ROUNDS = 60        # 最多重抽多少轮
-DRAW_WAIT = 3.0        # 点抽牌后等待翻牌的时间
-CONFIRM_WAIT = 3.0     # 点放弃后等待弹窗的时间
-RESET_WAIT = 8.0       # 点确认后等待回到抽牌界面的时间
-CLICK_SETTLE = 0.05    # 两次点击之间的间隔
+HAND_SIZE = 5                  # 手牌张数
 
-# 卡牌几何: 以 2560x1600 截图测量, 全部用比例表示
-SLOT_DX = 0.1075       # 点数中心相对卡牌左边的位置
-SLOT_DY = 0.1082       # 点数中心相对卡牌上边的位置
-SLOT_HW = 0.090        # 搜索半径(相对卡牌宽)
-SLOT_HH = 0.085        # 搜索半径(相对卡牌高)
-SLOT_PITCH_RATIO = 1.0985  # 卡牌间距 / 卡牌宽度 (368/335)
+# 卡牌取样框(相对单张卡牌矩形): cx, cy, 半宽, 半高; 由 2560x1600 截图测量
+RANK_BOX = (0.1104, 0.1173, 0.1015, 0.0752)   # 点数
+SUIT_BOX = (0.2985, 0.1283, 0.0597, 0.0487)   # 花色(小字形)
+
+MATCH_MIN = 0.55               # 模板匹配最低分(0~1)
+MATCH_MARGIN = 0.04            # 第一名与第二名的最小差距, 否则视为不确定
+
+REVEAL_WHITE = 0.22            # 卡牌"已翻开"判定: 白色像素占比阈值
+REVEAL_DARK = 0.03             # 同时要有深色笔画, 防止翻牌中途误判
+
+DRAW_WAIT = 3.0                # 点抽牌后等待翻牌的时间
+CONFIRM_WAIT = 3.0             # 点放弃后等待弹窗的时间
+RESET_WAIT = 8.0               # 点确认后等待回到抽牌界面的时间
+CLICK_SETTLE = 0.05            # 两次点击之间的间隔
+UNKNOWN_GIVE_UP = 25           # 识别不确定连续多少帧后放弃本局
+
+SLOT_PITCH_RATIO = 1.0985      # 卡牌间距 / 卡牌宽度 (368/335)
 
 # 找不到 5 张青色卡背时的兜底位置(相对窗口)
 FALLBACK_SLOTS = [
@@ -81,6 +96,23 @@ BTN_SPECS = {
     "start":    (0.70, 0.895, 0.94, 0.995, "white", 0.0015),
     "confirm":  (0.38, 0.50, 0.80, 0.76, "yellow",  0.0015),
 }
+
+SUITS = ("wan", "tiao", "tong")
+SUIT_CN = {"wan": "万", "tiao": "条", "tong": "筒"}
+RANKS = (1, 2, 3, 4, 5)
+
+# 目标牌型: key -> (中文名, 说明)
+PATTERNS = {
+    "straight": ("顺子", "五张内出现四连(1-2-3-4 或 2-3-4-5)"),
+    "flush": ("同花", "抽到四张同花色即停"),
+    "straight_flush": ("同花顺", "五张同花色且出现四连"),
+    "four": ("四条", "五张内有四张同点数(五条也算)"),
+    "full_house": ("葫芦", "五张内 三张同点 + 两张同点"),
+    "three": ("三条", "五张内有三张同点数"),
+    "two_pair": ("两对", "五张内两个不同点数各至少两张"),
+}
+PATTERN_ORDER = ["straight", "flush", "straight_flush", "four",
+                 "full_house", "three", "two_pair"]
 
 
 # ---------------------------------------------------------------- Win32
@@ -313,7 +345,24 @@ def click_norm(fx: float, fy: float) -> None:
     time.sleep(CLICK_SETTLE)
 
 
-# ---------------------------------------------------------------- 图像分析
+# ---------------------------------------------------------------- 卡牌识别
+
+@dataclass
+class Card:
+    rank: Optional[int]
+    suit: Optional[str]
+    rank_score: float = 0.0
+    suit_score: float = 0.0
+
+    @property
+    def known(self) -> bool:
+        return self.rank is not None and self.suit is not None
+
+    def __str__(self) -> str:
+        if self.rank is None or self.suit is None:
+            return "??"
+        return f"{self.rank}{SUIT_CN[self.suit]}"
+
 
 @dataclass
 class Slot:
@@ -322,8 +371,7 @@ class Slot:
     x1: int
     y1: int
     revealed: bool = False
-    five: bool = False
-    score: float = 0.0
+    card: Optional[Card] = None
 
     @property
     def w(self):
@@ -381,77 +429,6 @@ def fallback_slots(img: Image.Image):
             for fx, fy, fw, fh in FALLBACK_SLOTS]
 
 
-def digit_roi(s: Slot):
-    cx = s.x0 + SLOT_DX * s.w
-    cy = s.y0 + SLOT_DY * s.h
-    hw = SLOT_HW * s.w
-    hh = SLOT_HH * s.h
-    return int(cx - hw), int(cy - hh), int(cx + hw), int(cy + hh)
-
-
-def is_revealed(a: np.ndarray, s: Slot) -> bool:
-    """卡牌左上角既要是白底, 又要有已渲染的深色点数/文字, 才算"翻开的牌"。
-
-    只看白底会把翻牌动画中途的空白牌面也算进去, 导致点数为 0 的误判。
-    """
-    x0, y0, x1, y1 = digit_roi(s)
-    H, W = a.shape[:2]
-    x0, x1 = max(0, x0), min(W, x1)
-    y0, y1 = max(0, y0), min(H, y1)
-    if x1 - x0 < 5 or y1 - y0 < 5:
-        return False
-    patch = a[y0:y1, x0:x1]
-    R, G, B = patch[..., 0], patch[..., 1], patch[..., 2]
-    white = (R > 205) & (G > 200) & (B > 200)
-    dark = (R < 115) & (G < 115) & (B < 115)
-    return float(white.mean()) > FIVE_BOX_MEAN and float(dark.mean()) > 0.05
-
-
-_TEMPLATE_CACHE = {}
-
-
-def load_template():
-    if "tpl" not in _TEMPLATE_CACHE:
-        tpl = Image.open(TEMPLATE_FIVE).convert("L")
-        _TEMPLATE_CACHE["tpl"] = tpl
-    return _TEMPLATE_CACHE["tpl"]
-
-
-def _resize_gray(tpl: Image.Image, size) -> np.ndarray:
-    return np.asarray(tpl.resize(size, Image.LANCZOS), dtype=np.float32)
-
-
-def match_five(a_gray: np.ndarray, s: Slot) -> float:
-    """在卡牌左上角搜索数字 5, 返回最高 NCC 分数。"""
-    x0, y0, x1, y1 = digit_roi(s)
-    H, W = a_gray.shape[:2]
-    x0, x1 = max(0, x0), min(W, x1)
-    y0, y1 = max(0, y0), min(H, y1)
-    patch = a_gray[y0:y1, x0:x1]
-    if patch.shape[0] < 10 or patch.shape[1] < 10:
-        return 0.0
-    tpl = load_template()
-    target_h = 0.1236 * s.h
-    base = target_h / tpl.height
-    best = 0.0
-    for factor in (0.80, 0.90, 1.00, 1.10, 1.20):
-        s_ = base * factor
-        tw = max(6, int(round(tpl.width * s_)))
-        th = max(8, int(round(tpl.height * s_)))
-        if th >= patch.shape[0] or tw >= patch.shape[1]:
-            continue
-        t = _resize_gray(tpl, (tw, th))
-        tz = t - t.mean()
-        tn = float(np.sqrt((tz * tz).sum())) + 1e-6
-        win = np.lib.stride_tricks.sliding_window_view(patch, (th, tw))
-        wm = win.mean(axis=(2, 3), keepdims=True)
-        wc = win - wm
-        den = np.sqrt((wc * wc).sum(axis=(2, 3))) * tn + 1e-6
-        score = (wc * tz).sum(axis=(2, 3)) / den
-        best = max(best, float(score.max()))
-    return best
-
-
 def infer_slots(img: Image.Image, teal, prev_slots):
     """5 张青色卡背 -> 直接用; 部分翻开 -> 按等间距推; 都没有 -> 用兜底。"""
     W, H = img.size
@@ -477,23 +454,112 @@ def infer_slots(img: Image.Image, teal, prev_slots):
     return fallback_slots(img)
 
 
+def box_of(s: Slot, spec) -> Tuple[int, int, int, int]:
+    """取样框(相对卡牌): cx, cy, 半宽, 半高 -> 像素坐标。"""
+    cx, cy, hw, hh = spec
+    x0 = s.x0 + (cx - hw) * s.w
+    y0 = s.y0 + (cy - hh) * s.h
+    x1 = s.x0 + (cx + hw) * s.w
+    y1 = s.y0 + (cy + hh) * s.h
+    return int(round(x0)), int(round(y0)), int(round(x1)), int(round(y1))
+
+
+def is_revealed(a: np.ndarray, s: Slot) -> bool:
+    """卡牌左上角既要是白底, 又要有已渲染的深色点数/文字, 才算"翻开的牌"。
+
+    只看白底会把翻牌动画中途的空白牌面也算进去, 导致误判。
+    """
+    x0, y0, x1, y1 = box_of(s, RANK_BOX)
+    H, W = a.shape[:2]
+    x0, x1 = max(0, x0), min(W, x1)
+    y0, y1 = max(0, y0), min(H, y1)
+    if x1 - x0 < 5 or y1 - y0 < 5:
+        return False
+    patch = a[y0:y1, x0:x1]
+    R, G, B = patch[..., 0], patch[..., 1], patch[..., 2]
+    white = (R > 205) & (G > 200) & (B > 200)
+    dark = (R < 115) & (G < 115) & (B < 115)
+    return float(white.mean()) > REVEAL_WHITE and float(dark.mean()) > REVEAL_DARK
+
+
+_TPL = {}
+
+
+def load_templates() -> Dict[str, Image.Image]:
+    """载入点数/花色模板(灰度)。"""
+    if _TPL:
+        return _TPL
+    for r in RANKS:
+        p = os.path.join(TPL_DIR, f"r{r}.png")
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"缺少模板: {p}")
+        _TPL[f"r{r}"] = Image.open(p).convert("L")
+    for s in SUITS:
+        p = os.path.join(TPL_DIR, f"s_{s}.png")
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"缺少模板: {p}")
+        _TPL[f"s_{s}"] = Image.open(p).convert("L")
+    return _TPL
+
+
+def _ncc(patch: np.ndarray, tpl: Image.Image) -> float:
+    """模板缩放到取样框同尺寸后做归一化互相关(同为低分辨率, 避免上采样模糊)。"""
+    h, w = patch.shape
+    if h < 8 or w < 8:
+        return 0.0
+    t = np.asarray(tpl.resize((w, h), Image.LANCZOS), dtype=np.float32)
+    a = patch - float(patch.mean())
+    b = t - float(t.mean())
+    den = float(np.sqrt((a * a).sum() * (b * b).sum()))
+    if den < 1e-6:
+        return 0.0
+    return float((a * b).sum() / den)
+
+
+def _best(scores: Dict[str, float]) -> Tuple[Optional[str], float, float]:
+    """返回 (最佳键, 最佳分, 与次佳的差距)。"""
+    if not scores:
+        return None, 0.0, 0.0
+    ordered = sorted(scores.items(), key=lambda kv: -kv[1])
+    key, score = ordered[0]
+    margin = score - ordered[1][1] if len(ordered) > 1 else 1.0
+    return key, float(score), float(margin)
+
+
+def read_card(gray: np.ndarray, s: Slot) -> Card:
+    """读取一张已翻开的牌: 点数 + 花色。不确定的项记为 None。"""
+    tpl = load_templates()
+    x0, y0, x1, y1 = box_of(s, RANK_BOX)
+    H, W = gray.shape[:2]
+    rpatch = gray[max(0, y0):min(H, y1), max(0, x0):min(W, x1)]
+    x0, y0, x1, y1 = box_of(s, SUIT_BOX)
+    spatch = gray[max(0, y0):min(H, y1), max(0, x0):min(W, x1)]
+
+    rank_scores = {str(r): _ncc(rpatch, tpl[f"r{r}"]) for r in RANKS}
+    suit_scores = {s_: _ncc(spatch, tpl[f"s_{s_}"]) for s_ in SUITS}
+    rk, rs, rm = _best(rank_scores)
+    sk, ss, sm = _best(suit_scores)
+
+    rank = int(rk) if (rk and rs >= MATCH_MIN and rm >= MATCH_MARGIN) else None
+    suit = sk if (sk and ss >= MATCH_MIN and sm >= MATCH_MARGIN) else None
+    return Card(rank, suit, rs, ss)
+
+
 def analyze_slots(img: Image.Image, prev_slots=None, a=None, gray=None):
-    """返回 (slots, revealed_count, fives_count)。"""
+    """返回 (slots, cards)。cards 只包含已翻开且识别成功的牌(按槽位顺序)。"""
     if a is None:
         a = np.asarray(img.convert("RGB")).astype(np.int16)
     if gray is None:
         gray = np.asarray(img.convert("L")).astype(np.float32)
     teal = detect_teal_slots(img, a)
     slots = infer_slots(img, teal, prev_slots)
-    revealed = 0
-    fives = 0
+    cards = []
     for s in slots:
         s.revealed = is_revealed(a, s)
-        s.score = match_five(gray, s) if s.revealed else 0.0
-        s.five = s.revealed and s.score >= DIGIT_FIVE_THRESHOLD
-        revealed += int(s.revealed)
-        fives += int(s.five)
-    return slots, revealed, fives
+        s.card = read_card(gray, s) if s.revealed else None
+        if s.revealed and s.card is not None and s.card.known:
+            cards.append(s.card)
+    return slots, cards
 
 
 def color_mask(spec: str, a: np.ndarray) -> np.ndarray:
@@ -525,23 +591,172 @@ def find_button(a: np.ndarray, name: str):
     return fx, fy
 
 
+# ---------------------------------------------------------------- 牌型判定
+
+def rank_counts(cards: List[Card]) -> Dict[int, int]:
+    out: Dict[int, int] = {}
+    for c in cards:
+        if c.rank is not None:
+            out[c.rank] = out.get(c.rank, 0) + 1
+    return out
+
+
+def suit_counts(cards: List[Card]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for c in cards:
+        if c.suit is not None:
+            out[c.suit] = out.get(c.suit, 0) + 1
+    return out
+
+
+STRAIGHT_WINDOWS = ((1, 2, 3, 4), (2, 3, 4, 5))
+
+
+def has_straight4(cards: List[Card]) -> bool:
+    have = set(rank_counts(cards))
+    return any(all(r in have for r in w) for w in STRAIGHT_WINDOWS)
+
+
+def has_flush4(cards: List[Card]) -> bool:
+    return bool(suit_counts(cards)) and max(suit_counts(cards).values()) >= 4
+
+
+def has_four(cards: List[Card]) -> bool:
+    return bool(rank_counts(cards)) and max(rank_counts(cards).values()) >= 4
+
+
+def has_full_house(cards: List[Card]) -> bool:
+    cs = sorted(rank_counts(cards).values(), reverse=True)
+    return len(cs) >= 2 and cs[0] >= 3 and cs[1] >= 2
+
+
+def has_three(cards: List[Card]) -> bool:
+    return bool(rank_counts(cards)) and max(rank_counts(cards).values()) >= 3
+
+
+def has_two_pair(cards: List[Card]) -> bool:
+    return sum(1 for v in rank_counts(cards).values() if v >= 2) >= 2
+
+
+def is_hit(cards: List[Card], target: str) -> bool:
+    """当前牌面是否已达成目标(包含语义: 更大的牌型也算)。"""
+    if target == "flush":
+        # 四张同花色即停, 不必抽满
+        return len(cards) >= 4 and has_flush4(cards)
+    if len(cards) < HAND_SIZE:
+        return False
+    if target == "straight":
+        return has_straight4(cards)
+    if target == "straight_flush":
+        return len(suit_counts(cards)) == 1 and has_straight4(cards)
+    if target == "four":
+        return has_four(cards)
+    if target == "full_house":
+        return has_full_house(cards)
+    if target == "three":
+        return has_three(cards)
+    if target == "two_pair":
+        return has_two_pair(cards)
+    raise ValueError(f"未知牌型: {target}")
+
+
+def can_complete(cards: List[Card], target: str) -> bool:
+    """手牌不变的前提下, 后面的空位是否还有可能凑成目标(保守: 不看牌库剩余)。"""
+    if is_hit(cards, target):
+        return True
+    rem = HAND_SIZE - len(cards)
+    if rem <= 0:
+        return False
+    rc = rank_counts(cards)
+    max_rank = max(rc.values()) if rc else 0
+    sc = suit_counts(cards)
+    max_suit = max(sc.values()) if sc else 0
+
+    if target == "flush":
+        return max_suit + rem >= 4
+    if target == "straight":
+        have = set(rc)
+        return any(len([r for r in w if r not in have]) <= rem
+                   for w in STRAIGHT_WINDOWS)
+    if target == "straight_flush":
+        # 要求五张同花色, 花色一旦不齐就不可能
+        if len(sc) > 1:
+            return False
+        have = set(rc)
+        return any(len([r for r in w if r not in have]) <= rem
+                   for w in STRAIGHT_WINDOWS)
+    if target == "four":
+        return max_rank + rem >= 4
+    if target == "three":
+        return max_rank + rem >= 3
+    if target == "full_house":
+        ranks = set(rc) | set(range(1, 6))
+        for r in ranks:
+            need3 = max(0, 3 - rc.get(r, 0))
+            if need3 > rem:
+                continue
+            for q in ranks:
+                if q == r:
+                    continue
+                need2 = max(0, 2 - rc.get(q, 0))
+                if need3 + need2 <= rem:
+                    return True
+        return False
+    if target == "two_pair":
+        pairs = sum(1 for v in rc.values() if v >= 2)
+        singles = sum(1 for v in rc.values() if v == 1)
+        if pairs >= 2:
+            return True
+        if pairs == 1:
+            need = 1 if singles > 0 else 2
+            return need <= rem
+        need = 2 if singles >= 2 else (3 if singles == 1 else 4)
+        return need <= rem
+    raise ValueError(f"未知牌型: {target}")
+
+
+def decide(cards: List[Card], target: str) -> str:
+    """返回 stop(已达成) / abandon(不可能) / draw(继续抽)。"""
+    if is_hit(cards, target):
+        return "stop"
+    if not can_complete(cards, target):
+        return "abandon"
+    return "draw"
+
+
+def fmt_cards(cards: List[Card]) -> str:
+    return " ".join(str(c) for c in cards) if cards else "-"
+
+
+def _disp_width(text: str) -> int:
+    """终端显示宽度(中文按 2 列算)。"""
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+
+
+def pad(text: str, width: int) -> str:
+    return text + " " * max(0, width - _disp_width(text))
+
+
 # ---------------------------------------------------------------- 状态与动作
 
 @dataclass
 class Frame:
     slots: list
+    cards: List[Card]
     revealed: int
-    fives: int
     buttons: dict = field(default_factory=dict)
+    unknown: int = 0
 
 
 def inspect(img: Image.Image, prev_slots=None, with_start: bool = False) -> Frame:
     a = np.asarray(img.convert("RGB")).astype(np.int16)
     gray = np.asarray(img.convert("L")).astype(np.float32)
-    slots, revealed, fives = analyze_slots(img, prev_slots, a=a, gray=gray)
+    slots, cards = analyze_slots(img, prev_slots, a=a, gray=gray)
+    revealed = sum(1 for s in slots if s.revealed)
     names = ("draw", "abandon", "confirm") + (("start",) if with_start else ())
     buttons = {name: find_button(a, name) for name in names}
-    return Frame(slots, revealed, fives, buttons)
+    return Frame(slots, cards, revealed, buttons,
+                 unknown=max(0, revealed - len(cards)))
 
 
 def wait_frame(grabber, pred, timeout, prev_slots=None, interval=0.06):
@@ -560,33 +775,45 @@ def wait_frame(grabber, pred, timeout, prev_slots=None, interval=0.06):
 # ---------------------------------------------------------------- 主流程
 
 def cmd_check(img: Image.Image):
+    load_templates()
     fr = inspect(img, with_start=True)
     print(f"窗口图像: {img.size[0]}x{img.size[1]}")
     print(f"识别到卡槽: {len(fr.slots)}")
     for i, s in enumerate(fr.slots):
-        print(f"  #{i+1} 翻开={s.revealed} 是5={s.five} 分数={s.score:.3f}")
-    print(f"已翻开: {fr.revealed}  点数5: {fr.fives}")
+        if s.revealed and s.card is not None:
+            c = s.card
+            print(f"  #{i+1} {str(c):>4}  点数分={c.rank_score:.3f} 花色分={c.suit_score:.3f}")
+        else:
+            print(f"  #{i+1} 未翻开/无法识别")
+    print(f"已翻开: {fr.revealed}  识别成功: {len(fr.cards)}  -> {fmt_cards(fr.cards)}")
+    for name, (cn, _desc) in PATTERNS.items():
+        print(f"  {cn:<4} {'可达成' if can_complete(fr.cards, name) else '不可能'}"
+              f" / {'已达成' if is_hit(fr.cards, name) else '-'}")
     for k, v in fr.buttons.items():
         print(f"按钮 {k}: {'(%.3f, %.3f)' % v if v else '未找到'}")
     return fr
 
 
-def decide_action(n: int, f: int) -> str:
-    """已抽 n 张、其中点数 5 有 f 张时的决策: draw / abandon / stop。
-
-    - 抽满 5 张: f>=4 停手, 否则放弃;
-    - 未满: f < n-1 说明剩余位置全出 5 也凑不够 4 张, 立即放弃;
-    - 其它情况继续抽(即使第 4 张就已经 4 个 5, 也按你的要求抽满 5 张)。
-    """
-    if n >= HAND_SIZE:
-        return "stop" if f >= 4 else "abandon"
-    if f < n - 1:
-        return "abandon"
-    return "draw"
+def choose_pattern() -> str:
+    print("请选择目标牌型:")
+    for i, key in enumerate(PATTERN_ORDER, 1):
+        cn, desc = PATTERNS[key]
+        print(f"  {i}. {cn:<4} {desc}")
+    raw = input("输入编号 [1]: ").strip() or "1"
+    if raw.isdigit() and 1 <= int(raw) <= len(PATTERN_ORDER):
+        return PATTERN_ORDER[int(raw) - 1]
+    for key, (cn, _d) in PATTERNS.items():
+        if raw in (cn, key):
+            return key
+    print(f"无效选择 {raw!r}, 默认用顺子")
+    return PATTERN_ORDER[0]
 
 
 def live(args) -> int:
     enable_dpi_awareness()
+    target = args.pattern
+    pat_cn, pat_desc = PATTERNS[target]
+
     if getattr(args, "hwnd", None):
         info = window_info(int(args.hwnd))
         if not info["hwnd"]:
@@ -599,9 +826,10 @@ def live(args) -> int:
         print_window_hint()
         return 2
     hwnd = info["hwnd"]
-    title = info["title"]
+    print(f"百趣演武 · 自动抽牌  v{__version__}")
+    print(f"目标牌型: {pat_cn} —— {pat_desc}")
     print(f"找到窗口: hwnd={hwnd:#x} exe={os.path.basename(info['exe'])!r} "
-          f"class={info['cls']!r} title={title!r}")
+          f"class={info['cls']!r} title={info['title']!r}")
     if is_elevated_pid(info["pid"]) and not is_elevated_pid(os.getpid()):
         print("[!] 游戏进程是管理员权限, 当前脚本不是; 系统会拦截模拟点击。")
         print("    请右键「以管理员身份运行」run.bat 或 python。")
@@ -622,6 +850,7 @@ def live(args) -> int:
         print("请把游戏窗口完整移回屏幕内(或最大化)后再运行。")
         return 2
     print(f"还原后客户区 {rect[2]}x{rect[3]} @ ({rect[0]},{rect[1]})")
+    load_templates()
     _APP["hwnd"] = hwnd
 
     def snap() -> Image.Image:
@@ -635,21 +864,29 @@ def live(args) -> int:
             print(f"[!] {e}")
             return False
 
-    prev_slots = None
     fr = inspect(snap())
-    print(f"初始: 手牌 {fr.revealed}/{HAND_SIZE}, 5 的数量 {fr.fives}, "
-          f"按钮 {[k for k, v in fr.buttons.items() if v]}")
+    print(f"初始: 手牌 {fr.revealed}/{HAND_SIZE} -> {fmt_cards(fr.cards)}")
     if args.check:
         cmd_check(snap())
         return 0
+    print("─" * 56)
 
-    for round_no in range(1, args.rounds + 1):
+    t_start = time.time()
+    round_no = 0
+    abandons = 0
+    while True:
+        round_no += 1
+        if args.rounds and round_no > args.rounds:
+            break
         prev_slots = None
+        prev_cards: List[Card] = []
         stalls = 0
         no_draw = 0
-        prev_n = 0
-        prev_f = 0
+        unknown_streak = 0
         last_draw_t = 0.0
+        printed_n = -1
+        debug_n = -1
+
         while True:
             if user32.GetForegroundWindow() != hwnd:
                 print("游戏窗口不在前台, 停止。")
@@ -662,70 +899,97 @@ def live(args) -> int:
                 time.sleep(0.8)
                 continue
 
-            n_raw, f_raw = fr.revealed, fr.fives
-            if f_raw < prev_f:
-                scores = " ".join(f"#{i+1}:{'5' if s.five else '-'}({s.score:.2f})"
-                                  for i, s in enumerate(fr.slots))
-                print(f"[!] 本帧 5 只读到 {f_raw} 张, 已确认过 {prev_f} 张 | {scores}")
-            # 同一轮内牌只增不减: 已翻开数和已确认的 5 都取历史最大值, 防抖
-            n = max(n_raw, prev_n)
-            f = max(f_raw, prev_f)
-            prev_n, prev_f = n, f
-            action = decide_action(n, f)
-            reason = None
+            if fr.unknown:
+                unknown_streak += 1
+                if unknown_streak > UNKNOWN_GIVE_UP:
+                    print(f"[!] 有 {fr.unknown} 张牌识别不确定, 停止脚本以免误放弃。")
+                    for i, s in enumerate(fr.slots):
+                        if s.revealed and (s.card is None or not s.card.known):
+                            print(f"    槽位 #{i+1} 点数分={s.card.rank_score if s.card else 0:.2f} "
+                                  f"花色分={s.card.suit_score if s.card else 0:.2f}")
+                    print("    请把当时的截图发给我, 我再补模板。")
+                    return 6
+                time.sleep(0.12)
+                continue
+            unknown_streak = 0
+
+            # 新翻开的牌再复检一次, 两次读数一致才采信(防翻牌动画期间的误识别)
+            if len(fr.cards) > len(prev_cards):
+                sig = tuple((c.rank, c.suit) for c in fr.cards)
+                time.sleep(0.12)
+                fr2 = inspect(snap(), fr.slots)
+                prev_slots = fr2.slots
+                if fr2.unknown or tuple((c.rank, c.suit) for c in fr2.cards) != sig:
+                    time.sleep(0.06)
+                    continue
+                fr = fr2
+
+            # 同一轮内牌只增不减: 识别抖动时沿用上一帧结果
+            if len(fr.cards) >= len(prev_cards):
+                cards = fr.cards
+                prev_cards = cards
+            else:
+                cards = prev_cards
+
+            n = len(cards)
+            if args.debug and n != debug_n:
+                debug_n = n
+                detail = " ".join(
+                    f"#{i+1}:{s.card}({s.card.rank_score:.2f}/{s.card.suit_score:.2f})"
+                    for i, s in enumerate(fr.slots)
+                    if s.revealed and s.card is not None)
+                print(f"      [调试] {detail}")
+            action = decide(cards, target)
+
             if action == "stop":
-                print(f"[OK] 抽满 {HAND_SIZE} 张, 其中 5 有 {f} 张; 手牌已保留, 脚本退出。")
+                print("─" * 56)
+                cost = time.time() - t_start
+                print(f"[命中] 第 {round_no} 轮  {n}/{HAND_SIZE}  {fmt_cards(cards)}")
+                print(f"       牌型 {pat_cn} 达成; 用时 {cost/60:.1f} 分钟, "
+                      f"共 {round_no} 轮, 放弃 {abandons} 次。")
+                print("       已停手, 手牌保留; 需要你自己点「开始挑战」。")
                 return 0
+
             if action == "abandon":
                 if n >= HAND_SIZE:
-                    reason = f"抽满 {HAND_SIZE} 张只有 {f} 张 5"
+                    reason = f"抽满 5 张仍未达成{pat_cn}"
                 else:
-                    reason = f"已抽 {n} 张只有 {f} 张 5(至少需要 {n - 1} 张)"
-
-            if reason:
+                    reason = f"已抽 {n} 张, {pat_cn}已不可能"
                 # 放弃是不可逆操作: 先复查一帧, 防止翻牌动画/识别抖动误判
                 time.sleep(0.20)
                 fr2 = inspect(snap(), prev_slots)
                 prev_slots = fr2.slots
-                n2 = max(fr2.revealed, n)
-                f2 = max(fr2.fives, f)
-                act2 = decide_action(n2, f2)
-                if act2 == "stop":
-                    print(f"[OK] 复查: 抽满 5 张, 其中 5 有 {f2} 张; 手牌已保留, 脚本退出。")
-                    return 0
-                if act2 == "draw":
-                    print(f"[~] 复查后: 已抽 {n2} 张, 5 有 {f2} 张 -> 不放弃, 继续抽")
-                    fr, n, f = fr2, n2, f2
-                    prev_n, prev_f = n2, f2
-                    reason = None
-                else:
-                    scores = " ".join(f"#{i+1}:{'5' if s.five else '-'}({s.score:.2f})"
-                                      for i, s in enumerate(fr2.slots))
-                    print(f"    复查确认放弃 | {scores}")
-                    fr = fr2
-
-            if reason:
+                if fr2.unknown or len(fr2.cards) < len(cards):
+                    time.sleep(0.3)
+                    fr2 = inspect(snap(), prev_slots)
+                    prev_slots = fr2.slots
+                if fr2.cards and decide(fr2.cards, target) != "abandon":
+                    print(f"[~] 复查后放弃条件不成立({fmt_cards(fr2.cards)}), 继续")
+                    prev_cards = fr2.cards
+                    continue
                 pos = fr.buttons.get("abandon")
                 if not pos:
                     print("[!] 判定该放弃, 但没找到「放弃挑战」按钮, 停止。")
                     return 7
-                print(f"[x] {reason}, 放弃重抽")
+                print(f"[轮 {round_no:>3}] {n}/{HAND_SIZE}  {pad(fmt_cards(cards), 26)} "
+                      f"-> 放弃: {reason}")
                 if not safe_click(pos):
                     return 3
-                fr2, ok = wait_frame(snap, lambda f_: f_.buttons.get("confirm") is not None,
+                fr3, ok = wait_frame(snap, lambda f_: f_.buttons.get("confirm") is not None,
                                      CONFIRM_WAIT, prev_slots)
                 if not ok:
                     print("[!] 放弃确认弹窗没出现, 重试一次")
                     if not safe_click(pos):
                         return 3
-                    fr2, ok = wait_frame(snap, lambda f_: f_.buttons.get("confirm") is not None,
+                    fr3, ok = wait_frame(snap, lambda f_: f_.buttons.get("confirm") is not None,
                                          CONFIRM_WAIT, prev_slots)
                     if not ok:
                         print("[!] 放弃弹窗仍未出现, 停止。")
                         return 8
-                if not safe_click(fr2.buttons["confirm"]):
+                if not safe_click(fr3.buttons["confirm"]):
                     return 3
-                fr3, ok = wait_frame(
+                abandons += 1
+                fr4, ok = wait_frame(
                     snap,
                     lambda f_: f_.revealed == 0 and f_.buttons.get("draw") is not None,
                     RESET_WAIT, prev_slots)
@@ -737,7 +1001,6 @@ def live(args) -> int:
             # 继续抽一张
             pos = fr.buttons.get("draw")
             if not pos:
-                # 抽牌按钮可能还在翻牌动画/置灰, 稍等后重新判断(不要直接报错)
                 no_draw += 1
                 if no_draw > 25:
                     print(f"[!] 没找到可用的抽牌按钮 (已翻开 {fr.revealed}/{HAND_SIZE})")
@@ -746,24 +1009,22 @@ def live(args) -> int:
                 time.sleep(0.12)
                 continue
             no_draw = 0
+            if n != printed_n:
+                print(f"[轮 {round_no:>3}] {n}/{HAND_SIZE}  {pad(fmt_cards(cards), 26)} -> 继续")
+                printed_n = n
             before = fr.revealed
-            gap = (time.perf_counter() - last_draw_t) if last_draw_t else 0.0
-            print(f"[轮次 {round_no}] 已抽 {n} 张, 5 有 {f} 张 -> 继续抽"
-                  + (f" (上一抽耗时 {gap:.2f}s)" if gap else ""))
             if not safe_click(pos):
                 return 3
             last_click = time.perf_counter()
             last_draw_t = last_click
             deadline = last_click + DRAW_WAIT
             got_new = False
-            fr2 = fr
             while time.perf_counter() < deadline:
                 time.sleep(0.05)
                 fr2 = inspect(snap(), prev_slots)
                 prev_slots = fr2.slots
                 if fr2.buttons.get("confirm"):
-                    if not safe_click(fr2.buttons["confirm"]):
-                        return 3
+                    safe_click(fr2.buttons["confirm"])
                     time.sleep(0.5)
                     got_new = True
                     break
@@ -777,7 +1038,6 @@ def live(args) -> int:
                     if not safe_click(p2):
                         return 3
                     last_click = time.perf_counter()
-            prev_f = f
             if got_new:
                 stalls = 0
             else:
@@ -787,30 +1047,46 @@ def live(args) -> int:
                     print("连续 3 次抽牌无反应, 停止。")
                     return 5
 
-    print(f"达到最大轮数 {args.rounds}, 仍未凑够 4 张 5, 停止。")
+    print(f"达到设定轮数 {args.rounds}, 仍未达成{pat_cn}, 停止。")
     return 10
 
 
 def main():
     ap = argparse.ArgumentParser(
         prog="baiqu_yanyu",
-        description="百趣演武自动抽牌: 抽满 5 张, 至少 4 张点数 5; 否则放弃重抽。",
+        description="百趣演武自动抽牌: 按选定牌型抽牌, 不可能就放弃重抽。",
     )
     ap.add_argument("--check", action="store_true", help="只截图识别, 不点击")
     ap.add_argument("--image", metavar="PATH", help="离线分析一张截图")
-    ap.add_argument("--rounds", type=int, default=MAX_ROUNDS, help="最多放弃重抽轮数")
+    ap.add_argument("-p", "--pattern", metavar="牌型",
+                    help="目标牌型: " + " / ".join(f"{k}({PATTERNS[k][0]})" for k in PATTERN_ORDER))
+    ap.add_argument("-r", "--rounds", type=int, default=0,
+                    help="最多跑多少轮, 0=无限制(默认)")
     ap.add_argument("--hwnd", type=lambda s: int(s, 0),
                     help="手动指定窗口句柄(如 0x123456)")
+    ap.add_argument("--debug", action="store_true", help="打印每张牌的识别分数")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args()
 
     if args.image:
-        img = Image.open(args.image).convert("RGB")
-        cmd_check(img)
+        cmd_check(Image.open(args.image).convert("RGB"))
         return 0
-    if not os.path.exists(TEMPLATE_FIVE):
-        print(f"缺少模板: {TEMPLATE_FIVE}")
-        return 2
+
+    if args.pattern:
+        raw = args.pattern.strip()
+        key = None
+        for k, (cn, _d) in PATTERNS.items():
+            if raw == k or raw == cn:
+                key = k
+                break
+        if key is None:
+            print(f"未知牌型: {raw}")
+            print("可选: " + " / ".join(f"{k}({PATTERNS[k][0]})" for k in PATTERN_ORDER))
+            return 2
+        args.pattern = key
+    else:
+        args.pattern = choose_pattern()
+
     try:
         return live(args)
     except KeyboardInterrupt:

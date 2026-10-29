@@ -27,3 +27,6 @@ vendor/
 # Editors
 .idea/
 .vscode/
+
+# 本地分析/测试截图
+analysis/

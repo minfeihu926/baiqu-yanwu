@@ -1,11 +1,11 @@
-# -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller 打包配置: 单文件、带控制台、内置点数模板。"""
+﻿# -*- mode: python ; coding: utf-8 -*-
+"""PyInstaller 打包配置: 单文件、带控制台、内置识别模板。"""
 
 a = Analysis(
     ['baiqu_yanyu.py'],
     pathex=[],
     binaries=[],
-    datas=[('templates/digit5.png', 'templates')],
+    datas=[('templates', 'templates')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
