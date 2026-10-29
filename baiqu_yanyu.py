@@ -1009,11 +1009,12 @@ def live(args) -> int:
                   + (f" (上一抽 {gap:.1f}s)" if gap else ""))
             before = fr.revealed
             before_teal = fr.teal
+            want = len(fr.cards) + 1
             if not safe_click(pos):
                 return 3
             last_click = time.perf_counter()
             last_draw_t = last_click
-            # 不设超时、不计数重试: 一直截图, 直到翻出下一张
+            # 不设超时、不计数重试: 一直截图, 直到这张牌被认出来为止
             while True:
                 fr2 = inspect(snap(), prev_slots, cache=card_cache)
                 prev_slots = fr2.slots
@@ -1022,10 +1023,14 @@ def live(args) -> int:
                 if fr2.buttons.get("confirm"):
                     safe_click(fr2.buttons["confirm"])
                     break
-                if fr2.revealed > before or fr2.teal < before_teal:
+                if len(fr2.cards) >= want:
                     break
-                # 点击没生效(抽牌按钮还在): 过 1s 再补点一次, 但不中止
-                if time.perf_counter() - last_click > 1.0:
+                # 手牌已满却认不全(有张牌认不出来): 回主循环按"牌满"处理
+                if fr2.revealed >= HAND_SIZE and len(fr2.cards) < want:
+                    break
+                # 画面完全没动(点击没生效)才补点一次
+                if (time.perf_counter() - last_click > 1.0
+                        and fr2.revealed <= before and fr2.teal >= before_teal):
                     p2 = fr2.buttons.get("draw")
                     if p2 and not safe_click(p2):
                         return 3
