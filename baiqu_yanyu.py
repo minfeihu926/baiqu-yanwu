@@ -918,6 +918,9 @@ def cmd_check(img: Image.Image):
         else:
             print(f"  #{i+1} 未翻开/无法识别")
     print(f"已翻开: {fr.revealed}  识别成功: {len(fr.cards)}  -> {fmt_cards(fr.cards)}")
+    if fr.overlay > 0.25:
+        print(f"[!] 手牌区域有 {fr.overlay*100:.0f}% 被其它窗口遮住, 识别结果不可信; "
+              f"请把控制台/其它窗口移开游戏画面后再试。")
     for name, (cn, _desc) in PATTERNS.items():
         print(f"  {pad(cn, 6)} {'可达成' if can_complete(fr.cards, name) else '不可能'}"
               f" / {'已达成' if is_hit(fr.cards, name) else '-'}")
