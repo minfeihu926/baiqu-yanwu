@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 百趣演武 · 自动抽牌(第一轮)
@@ -44,7 +44,7 @@ from typing import Dict, List, Optional
 import numpy as np
 from PIL import Image, ImageGrab
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 if getattr(sys, "frozen", False):
     # PyInstaller onefile: 资源解压在 sys._MEIPASS
@@ -333,10 +333,13 @@ def click_norm(fx: float, fy: float) -> None:
     rect = client_rect(hwnd)
     x, y, w, h = rect
     sx, sy = int(x + fx * w), int(y + fy * h)
+    # 先移到按钮上停一下(让游戏收到 hover), 再按下抬起; 直接点容易被吞
+    user32.SetCursorPos(sx - 3, sy)
+    time.sleep(0.03)
     user32.SetCursorPos(sx, sy)
-    time.sleep(0.04)
+    time.sleep(0.10)
     user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
-    time.sleep(0.05)
+    time.sleep(0.06)
     user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
     time.sleep(CLICK_SETTLE)
 
@@ -1014,7 +1017,9 @@ def live(args) -> int:
                 return 3
             last_click = time.perf_counter()
             last_draw_t = last_click
-            # 不设超时、不计数重试: 一直截图, 直到这张牌被认出来为止
+            last_change = last_click
+            round_failed = False
+            # 一直截图, 直到这张牌被认出来为止(不设短超时)
             while True:
                 fr2 = inspect(snap(), prev_slots, cache=card_cache)
                 prev_slots = fr2.slots
@@ -1023,18 +1028,31 @@ def live(args) -> int:
                 if fr2.buttons.get("confirm"):
                     safe_click(fr2.buttons["confirm"])
                     break
+                if fr2.revealed > before or fr2.teal < before_teal:
+                    last_change = time.perf_counter()
                 if len(fr2.cards) >= want:
                     break
                 # 手牌已满却认不全(有张牌认不出来): 回主循环按"牌满"处理
                 if fr2.revealed >= HAND_SIZE and len(fr2.cards) < want:
                     break
-                # 画面完全没动(点击没生效)才补点一次
-                if (time.perf_counter() - last_click > 1.0
+                # 画面完全没动、抽牌按钮还亮着 = 这次点击没生效 -> 补点
+                p2 = fr2.buttons.get("draw")
+                if (p2 and (time.perf_counter() - last_click) > 0.6
                         and fr2.revealed <= before and fr2.teal >= before_teal):
-                    p2 = fr2.buttons.get("draw")
-                    if p2 and not safe_click(p2):
+                    if not safe_click(p2):
                         return 3
                     last_click = time.perf_counter()
+                # 保险丝: 8 秒画面完全没变化, 说明这一局卡住了, 放弃重抽
+                if time.perf_counter() - last_change > 8.0:
+                    print("[!] 8 秒没有翻出牌, 放弃本局重抽")
+                    ok, code = do_abandon(fr2)
+                    if not ok:
+                        return code
+                    round_failed = True
+                    break
+            if round_failed:
+                abandons += 1
+                break
 
     print(f"达到设定轮数 {args.rounds}, 仍未达成{pat_cn}, 停止。")
     return 10
