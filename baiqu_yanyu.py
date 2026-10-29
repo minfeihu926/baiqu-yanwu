@@ -41,7 +41,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from PIL import Image, ImageGrab
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 if getattr(sys, "frozen", False):
     # PyInstaller onefile: 资源解压在 sys._MEIPASS
@@ -66,6 +66,12 @@ RANK_BOX = (0.1104, 0.1173, 0.1015, 0.0752)   # 点数
 SUIT_BOX = (0.2985, 0.1283, 0.0597, 0.0487)   # 花色(小字形)
 
 SEARCH_MARGIN = 0.05           # 取样框外扩比例(相对卡宽), 容忍卡槽推算的几像素误差
+SEARCH_MAX_MARGIN_PX = 16      # 搜索边距上限(像素), 防止卡槽尺寸异常时搜索爆炸
+
+# 单张卡牌应占窗口的比例(由 2560x1600 截图测得), 用来剔除错误的卡槽
+CARD_W_RANGE = (0.10, 0.17)
+CARD_H_RANGE = (0.21, 0.35)
+CARD_ASPECT = 452 / 335        # 卡牌 高/宽, 由截图测得
 
 MATCH_MIN = 0.55               # 模板匹配最低分(0~1)
 MATCH_MARGIN = 0.04            # 第一名与第二名的最小差距, 否则视为不确定
@@ -412,14 +418,22 @@ def detect_teal_slots(img: Image.Image, a=None):
     thr = max(8, int(H * 0.02))
     slots = []
     for x0, x1 in runs_of(cols > thr, min_len=max(10, int(W * 0.05))):
-        if (x1 - x0) > W * 0.45:
+        # 单张卡背宽度应约为窗口宽的 13%; 翻牌过程中相邻两张青色可能连成一片,
+        # 这种过宽的 run 必须丢掉, 否则会推出离谱的卡槽尺寸(逐像素搜索会卡死)
+        if not (CARD_W_RANGE[0] * W <= (x1 - x0 + 1) <= CARD_W_RANGE[1] * W):
             continue
         sub = teal[:, x0:x1 + 1]
         rows = sub.sum(axis=1)
         ys = np.nonzero(rows > max(4, (x1 - x0) * 0.15))[0]
         if len(ys) < 20:
             continue
-        slots.append(Slot(int(x0), int(ys.min()), int(x1), int(ys.max())))
+        # 卡背底部有青色反光, 直接取 ys.max() 会把卡槽拉高; 按卡牌固定长宽比重算
+        top = int(ys.min())
+        w = int(x1) - int(x0) + 1
+        h = int(round(w * CARD_ASPECT))
+        if not (CARD_H_RANGE[0] * H <= h <= CARD_H_RANGE[1] * H):
+            continue
+        slots.append(Slot(int(x0), top, int(x0) + w, top + h))
     slots.sort(key=lambda s: s.x0)
     return slots
 
@@ -437,11 +451,19 @@ def infer_slots(img: Image.Image, teal, prev_slots):
     if len(teal) == HAND_SIZE:
         return teal
     if len(teal) >= 1:
+        anchor = min(teal, key=lambda s: s.x0)
+        # 上一帧已经有准确卡槽(通常来自 5 张卡背那一帧) -> 只按位移平移, 别重新推间距
+        if prev_slots is not None and len(prev_slots) == HAND_SIZE:
+            idx0 = min(range(HAND_SIZE), key=lambda i: abs(prev_slots[i].x0 - anchor.x0))
+            dx = anchor.x0 - prev_slots[idx0].x0
+            dy = anchor.y0 - prev_slots[idx0].y0
+            if abs(dx) <= W * 0.03 and abs(dy) <= H * 0.03:
+                return [Slot(s.x0 + dx, s.y0 + dy, s.x1 + dx, s.y1 + dy)
+                        for s in prev_slots]
         w = float(np.median([s.w for s in teal]))
         y0 = int(np.median([s.y0 for s in teal]))
         y1 = int(np.median([s.y1 for s in teal]))
         pitch = w * SLOT_PITCH_RATIO
-        anchor = min(teal, key=lambda s: s.x0)
         fb = fallback_slots(img)
         idx = min(range(HAND_SIZE), key=lambda i: abs(fb[i].x0 - anchor.x0))
         x0 = anchor.x0 - idx * pitch
@@ -504,54 +526,41 @@ def load_templates() -> Dict[str, Image.Image]:
     return _TPL
 
 
-def _ncc(win: np.ndarray, tz: np.ndarray, tn: float) -> float:
-    a = win - float(win.mean())
-    den = float(np.sqrt((a * a).sum())) * tn + 1e-6
-    return float((a * tz).sum() / den)
+def _match(patch: np.ndarray, tpl: Image.Image, size):
+    """模板缩放到取样尺寸后, 在 patch 内滑动取最高 NCC。
 
-
-def _scan(patch, tz, tn, xs, ys, th, tw):
-    best, bx, by = -1.0, 0, 0
-    for oy in ys:
-        for ox in xs:
-            win = patch[oy:oy + th, ox:ox + tw]
-            if win.shape != (th, tw):
-                continue
-            sc = _ncc(win, tz, tn)
-            if sc > best:
-                best, bx, by = sc, ox, oy
-    return best, bx, by
-
-
-def _match(patch: np.ndarray, tpl: Image.Image, size, offsets, refine=False) -> float:
-    """模板缩放到取样尺寸后, 按 offsets 平移取最高 NCC。
-
-    平移是为了容忍卡槽推算的几像素误差(窗口化时 卡槽间距/缩放 不完全一致)。
-    refine=True 时先粗搜再在最佳点附近 ±2px 细搜, 兼顾范围与速度。
+    滑动窗口会自动吸收卡槽推算带来的几像素偏差(窗口化时 16:9/16:10 的间距差异),
+    不需要卡槽完全对准。
     """
     tw, th = size
-    if patch.shape[0] < th or patch.shape[1] < tw:
-        return 0.0
+    if tw < 6 or th < 6 or tw > 240 or th > 240:
+        return 0.0, 0, 0
+    if patch.shape[0] < th + 1 or patch.shape[1] < tw + 1:
+        return 0.0, 0, 0
     t = np.asarray(tpl.resize((tw, th), Image.LANCZOS), dtype=np.float32)
     tz = t - float(t.mean())
     tn = float(np.sqrt((tz * tz).sum())) + 1e-6
-    offs = tuple(offsets)
-    if refine and len(offs) > 1:
-        coarse = offs[::3] if len(offs) > 5 else offs
-        best, bx, by = _scan(patch, tz, tn, coarse, coarse, th, tw)
-        fine = [v for v in range(max(0, bx - 2), min(patch.shape[1] - tw, bx + 2) + 1)
-                if v >= 0]
-        finey = [v for v in range(max(0, by - 2), min(patch.shape[0] - th, by + 2) + 1)
-                 if v >= 0]
-        best2, _, _ = _scan(patch, tz, tn, fine, finey, th, tw)
-        return max(best, best2, 0.0)
-    best, _, _ = _scan(patch, tz, tn, offs, offs, th, tw)
-    return max(best, 0.0)
 
+    win = np.lib.stride_tricks.sliding_window_view(patch, (th, tw))
+    stride = 2 if max(win.shape[0], win.shape[1]) > 12 else 1
+    win = win[::stride, ::stride]
+    wc = win - win.mean(axis=(2, 3), keepdims=True)
+    den = np.sqrt((wc * wc).sum(axis=(2, 3))) * tn + 1e-6
+    sc = (wc * tz).sum(axis=(2, 3)) / den
+    k = np.unravel_index(int(np.argmax(sc)), sc.shape)
+    best = float(sc[k])
+    bx, by = int(k[1]) * stride, int(k[0]) * stride
 
-def _box_with_margin(s: Slot, spec, margin: int):
-    x0, y0, x1, y1 = box_of(s, spec)
-    return x0 - margin, y0 - margin, x1 + margin, y1 + margin
+    if stride > 1:  # 粗搜步长 2, 再在最佳点 ±1 内细搜
+        for oy in range(max(0, by - 1), min(patch.shape[0] - th, by + 2) + 1):
+            for ox in range(max(0, bx - 1), min(patch.shape[1] - tw, bx + 2) + 1):
+                w2 = patch[oy:oy + th, ox:ox + tw]
+                a2 = w2 - float(w2.mean())
+                d2 = float(np.sqrt((a2 * a2).sum())) * tn + 1e-6
+                s2 = float((a2 * tz).sum() / d2)
+                if s2 > best:
+                    best, bx, by = s2, ox, oy
+    return max(best, 0.0), bx, by
 
 
 def _best(scores: Dict[str, float]) -> Tuple[Optional[str], float, float]:
@@ -564,41 +573,49 @@ def _best(scores: Dict[str, float]) -> Tuple[Optional[str], float, float]:
     return key, float(score), float(margin)
 
 
-def read_card(gray: np.ndarray, s: Slot, thorough: bool = False) -> Card:
-    """读取一张已翻开的牌: 点数 + 花色。不确定的项记为 None。
+def read_card(gray: np.ndarray, s: Slot):
+    """读取一张牌: 返回 (Card, dx, dy)。dx/dy 是匹配到的最佳位置相对卡槽的偏移。
 
-    thorough=False 只在中心位置比对一次; True 时在 ±SEARCH_MARGIN 内逐 2px 搜索。
+    不确定的项记为 None; 卡槽尺寸异常时直接返回空结果(不拿错误几何去搜索)。
     """
-    tpl = load_templates()
-    m = max(2, int(round(SEARCH_MARGIN * s.w)))
-    offsets = tuple(range(0, 2 * m + 1)) if thorough else (m,)
     H, W = gray.shape[:2]
+    if not (CARD_W_RANGE[0] * W <= s.w <= CARD_W_RANGE[1] * W
+            and CARD_H_RANGE[0] * H <= s.h <= CARD_H_RANGE[1] * H):
+        return Card(None, None), 0, 0
 
-    # 取样尺寸与中心位置必须用同一套整数坐标, 否则会差 1~2px 拉低分数
+    tpl = load_templates()
+    m = max(3, min(int(round(SEARCH_MARGIN * s.w)), SEARCH_MAX_MARGIN_PX))
+
     rb = box_of(s, RANK_BOX)
     tw, th = max(12, rb[2] - rb[0]), max(12, rb[3] - rb[1])
-    x0, y0, x1, y1 = rb[0] - m, rb[1] - m, rb[2] + m, rb[3] + m
-    rpatch = gray[max(0, y0):min(H, y1), max(0, x0):min(W, x1)]
+    rpatch = gray[max(0, rb[1] - m):min(H, rb[3] + m),
+                  max(0, rb[0] - m):min(W, rb[2] + m)]
 
     sb = box_of(s, SUIT_BOX)
     sw, sh = max(10, sb[2] - sb[0]), max(10, sb[3] - sb[1])
-    x0, y0, x1, y1 = sb[0] - m, sb[1] - m, sb[2] + m, sb[3] + m
-    spatch = gray[max(0, y0):min(H, y1), max(0, x0):min(W, x1)]
+    spatch = gray[max(0, sb[1] - m):min(H, sb[3] + m),
+                  max(0, sb[0] - m):min(W, sb[2] + m)]
 
-    rank_scores = {str(r): _match(rpatch, tpl[f"r{r}"], (tw, th), offsets, thorough)
-                   for r in RANKS}
-    suit_scores = {s_: _match(spatch, tpl[f"s_{s_}"], (sw, sh), offsets, thorough)
-                   for s_ in SUITS}
-    rk, rs, rm = _best(rank_scores)
+    rank_best, rank_off = {}, None
+    for r in RANKS:
+        sc, ox, oy = _match(rpatch, tpl[f"r{r}"], (tw, th))
+        rank_best[str(r)] = sc
+        if rank_off is None or sc > rank_off[0]:
+            rank_off = (sc, ox, oy)
+    suit_scores = {s_: _match(spatch, tpl[f"s_{s_}"], (sw, sh))[0] for s_ in SUITS}
+    rk, rs, rm = _best(rank_best)
     sk, ss, sm = _best(suit_scores)
 
     rank = int(rk) if (rk and rs >= MATCH_MIN and rm >= MATCH_MARGIN) else None
     suit = sk if (sk and ss >= MATCH_MIN and sm >= MATCH_MARGIN) else None
-    return Card(rank, suit, rs, ss)
+    dx = dy = 0
+    if rank is not None:
+        dx = max(-m, min(m, int(rank_off[1]) - m))
+        dy = max(-m, min(m, int(rank_off[2]) - m))
+    return Card(rank, suit, rs, ss), dx, dy
 
 
-def analyze_slots(img: Image.Image, prev_slots=None, a=None, gray=None,
-                  thorough: bool = False):
+def analyze_slots(img: Image.Image, prev_slots=None, a=None, gray=None):
     """返回 (slots, cards)。cards 只包含已翻开且识别成功的牌(按槽位顺序)。"""
     if a is None:
         a = np.asarray(img.convert("RGB")).astype(np.int16)
@@ -607,15 +624,16 @@ def analyze_slots(img: Image.Image, prev_slots=None, a=None, gray=None,
     teal = detect_teal_slots(img, a)
     slots = infer_slots(img, teal, prev_slots)
     cards = []
-    for s in slots:
+    for i, s in enumerate(slots):
         s.revealed = is_revealed(a, s)
         if not s.revealed:
             s.card = None
             continue
-        c = read_card(gray, s, False)
-        if thorough and (c is None or not c.known):
-            # 只对没认准的牌做逐像素搜索, 避免每帧都慢
-            c = read_card(gray, s, True)
+        c, dx, dy = read_card(gray, s)
+        if dx or dy:
+            # 用匹配到的最佳位置修正卡槽, 下一帧起就不用再搜那么远
+            s = Slot(s.x0 + dx, s.y0 + dy, s.x1 + dx, s.y1 + dy, revealed=True)
+            slots[i] = s
         s.card = c
         if c is not None and c.known:
             cards.append(c)
@@ -810,11 +828,10 @@ class Frame:
     unknown: int = 0
 
 
-def inspect(img: Image.Image, prev_slots=None, with_start: bool = False,
-            thorough: bool = False) -> Frame:
+def inspect(img: Image.Image, prev_slots=None, with_start: bool = False) -> Frame:
     a = np.asarray(img.convert("RGB")).astype(np.int16)
     gray = np.asarray(img.convert("L")).astype(np.float32)
-    slots, cards = analyze_slots(img, prev_slots, a=a, gray=gray, thorough=thorough)
+    slots, cards = analyze_slots(img, prev_slots, a=a, gray=gray)
     revealed = sum(1 for s in slots if s.revealed)
     names = ("draw", "abandon", "confirm") + (("start",) if with_start else ())
     buttons = {name: find_button(a, name) for name in names}
@@ -969,10 +986,6 @@ def live(args) -> int:
                 time.sleep(0.8)
                 continue
 
-            if fr.unknown:
-                # 中心位置没认准, 改用逐像素平移搜索再试一次
-                fr = inspect(snap(), prev_slots, thorough=True)
-                prev_slots = fr.slots
             if fr.unknown:
                 unknown_streak += 1
                 if unknown_streak > UNKNOWN_GIVE_UP:
