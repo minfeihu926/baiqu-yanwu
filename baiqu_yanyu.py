@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 百趣演武 · 自动抽牌(第一轮)
@@ -787,7 +787,7 @@ def cmd_check(img: Image.Image):
             print(f"  #{i+1} 未翻开/无法识别")
     print(f"已翻开: {fr.revealed}  识别成功: {len(fr.cards)}  -> {fmt_cards(fr.cards)}")
     for name, (cn, _desc) in PATTERNS.items():
-        print(f"  {cn:<4} {'可达成' if can_complete(fr.cards, name) else '不可能'}"
+        print(f"  {pad(cn, 6)} {'可达成' if can_complete(fr.cards, name) else '不可能'}"
               f" / {'已达成' if is_hit(fr.cards, name) else '-'}")
     for k, v in fr.buttons.items():
         print(f"按钮 {k}: {'(%.3f, %.3f)' % v if v else '未找到'}")
@@ -798,7 +798,7 @@ def choose_pattern() -> str:
     print("请选择目标牌型:")
     for i, key in enumerate(PATTERN_ORDER, 1):
         cn, desc = PATTERNS[key]
-        print(f"  {i}. {cn:<4} {desc}")
+        print(f"  {i}. {pad(cn, 6)} {desc}")
     raw = input("输入编号 [1]: ").strip() or "1"
     if raw.isdigit() and 1 <= int(raw) <= len(PATTERN_ORDER):
         return PATTERN_ORDER[int(raw) - 1]
