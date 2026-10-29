@@ -41,7 +41,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from PIL import Image, ImageGrab
 
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 
 if getattr(sys, "frozen", False):
     # PyInstaller onefile: 资源解压在 sys._MEIPASS
@@ -455,11 +455,18 @@ def infer_slots(img: Image.Image, teal, prev_slots):
         # 上一帧已经有准确卡槽(通常来自 5 张卡背那一帧) -> 只按位移平移, 别重新推间距
         if prev_slots is not None and len(prev_slots) == HAND_SIZE:
             idx0 = min(range(HAND_SIZE), key=lambda i: abs(prev_slots[i].x0 - anchor.x0))
-            dx = anchor.x0 - prev_slots[idx0].x0
-            dy = anchor.y0 - prev_slots[idx0].y0
-            if abs(dx) <= W * 0.03 and abs(dy) <= H * 0.03:
+            ref = prev_slots[idx0]
+            # 翻牌动画里露出的青色区域大小/位置都会变, 尺寸不对就直接忽略, 守住旧卡槽
+            if not (0.85 * ref.w <= anchor.w <= 1.15 * ref.w):
+                return prev_slots
+            dx = anchor.x0 - ref.x0
+            dy = anchor.y0 - ref.y0
+            if abs(dx) <= W * 0.01 and abs(dy) <= H * 0.01:
+                return prev_slots
+            if abs(dx) <= W * 0.03 and abs(dy) <= H * 0.01:
                 return [Slot(s.x0 + dx, s.y0 + dy, s.x1 + dx, s.y1 + dy)
                         for s in prev_slots]
+            return prev_slots
         w = float(np.median([s.w for s in teal]))
         y0 = int(np.median([s.y0 for s in teal]))
         y1 = int(np.median([s.y1 for s in teal]))
@@ -591,27 +598,30 @@ def read_card(gray: np.ndarray, s: Slot):
     rpatch = gray[max(0, rb[1] - m):min(H, rb[3] + m),
                   max(0, rb[0] - m):min(W, rb[2] + m)]
 
-    sb = box_of(s, SUIT_BOX)
-    sw, sh = max(10, sb[2] - sb[0]), max(10, sb[3] - sb[1])
-    spatch = gray[max(0, sb[1] - m):min(H, sb[3] + m),
-                  max(0, sb[0] - m):min(W, sb[2] + m)]
-
     rank_best, rank_off = {}, None
     for r in RANKS:
         sc, ox, oy = _match(rpatch, tpl[f"r{r}"], (tw, th))
         rank_best[str(r)] = sc
         if rank_off is None or sc > rank_off[0]:
             rank_off = (sc, ox, oy)
-    suit_scores = {s_: _match(spatch, tpl[f"s_{s_}"], (sw, sh))[0] for s_ in SUITS}
     rk, rs, rm = _best(rank_best)
+
+    dx = dy = 0
+    if rk is not None:
+        dx = max(-m, min(m, int(rank_off[1]) - m))
+        dy = max(-m, min(m, int(rank_off[2]) - m))
+
+    # 花色用点数匹配到的位移先对齐, 再在小范围里搜一次
+    s2 = Slot(s.x0 + dx, s.y0 + dy, s.x1 + dx, s.y1 + dy)
+    sb = box_of(s2, SUIT_BOX)
+    sw, sh = max(10, sb[2] - sb[0]), max(10, sb[3] - sb[1])
+    spatch = gray[max(0, sb[1] - m):min(H, sb[3] + m),
+                  max(0, sb[0] - m):min(W, sb[2] + m)]
+    suit_scores = {s_: _match(spatch, tpl[f"s_{s_}"], (sw, sh))[0] for s_ in SUITS}
     sk, ss, sm = _best(suit_scores)
 
     rank = int(rk) if (rk and rs >= MATCH_MIN and rm >= MATCH_MARGIN) else None
     suit = sk if (sk and ss >= MATCH_MIN and sm >= MATCH_MARGIN) else None
-    dx = dy = 0
-    if rank is not None:
-        dx = max(-m, min(m, int(rank_off[1]) - m))
-        dy = max(-m, min(m, int(rank_off[2]) - m))
     return Card(rank, suit, rs, ss), dx, dy
 
 
@@ -629,7 +639,11 @@ def analyze_slots(img: Image.Image, prev_slots=None, a=None, gray=None):
         if not s.revealed:
             s.card = None
             continue
+        old_card = s.card
         c, dx, dy = read_card(gray, s)
+        if not c.known and old_card is not None and old_card.known:
+            # 这张牌之前已经认准过, 别因为一帧抖动又变成"不确定"
+            c = old_card
         if dx or dy:
             # 用匹配到的最佳位置修正卡槽, 下一帧起就不用再搜那么远
             s = Slot(s.x0 + dx, s.y0 + dy, s.x1 + dx, s.y1 + dy, revealed=True)
@@ -719,8 +733,8 @@ def has_two_pair(cards: List[Card]) -> bool:
 def is_hit(cards: List[Card], target: str) -> bool:
     """当前牌面是否已达成目标(包含语义: 更大的牌型也算)。"""
     if target == "flush":
-        # 四张同花色即停, 不必抽满
-        return len(cards) >= 4 and has_flush4(cards)
+        # 绝对同色: 已抽的牌必须全是同一花色; 凑到 4 张即停
+        return len(cards) >= 4 and len(suit_counts(cards)) == 1
     if len(cards) < HAND_SIZE:
         return False
     if target == "straight":
@@ -753,7 +767,10 @@ def can_complete(cards: List[Card], target: str) -> bool:
     max_suit = max(sc.values()) if sc else 0
 
     if target == "flush":
-        return max_suit + rem >= 4
+        # 绝对同色: 已经出现第二种花色就不可能
+        if len(sc) > 1:
+            return False
+        return sum(sc.values()) + rem >= 4
     if target == "straight":
         have = set(rc)
         return any(len([r for r in w if r not in have]) <= rem
@@ -818,6 +835,16 @@ def pad(text: str, width: int) -> str:
 
 
 # ---------------------------------------------------------------- 状态与动作
+
+def save_dump(img: Image.Image, tag: str) -> None:
+    """出错时自动把脚本看到的画面存下来, 方便排查(不会影响游戏)。"""
+    try:
+        name = f"shot_{tag}_{time.strftime('%H%M%S')}.png"
+        img.save(name)
+        print(f"    已保存当时的画面: {os.path.abspath(name)}")
+    except Exception as e:  # noqa: BLE001
+        print(f"    保存截图失败: {e}")
+
 
 @dataclass
 class Frame:
@@ -994,7 +1021,7 @@ def live(args) -> int:
                         if s.revealed and (s.card is None or not s.card.known):
                             print(f"    槽位 #{i+1} 点数分={s.card.rank_score if s.card else 0:.2f} "
                                   f"花色分={s.card.suit_score if s.card else 0:.2f}")
-                    print("    请运行 `baiqu_yanyu.py --check --dump shot.png` 把 shot.png 发给我。")
+                    save_dump(snap(), "unknown")
                     return 6
                 time.sleep(0.12)
                 continue
@@ -1132,6 +1159,7 @@ def live(args) -> int:
                 print(f"[!] 抽牌后未检测到新翻开的牌 (重试 {stalls}/3)")
                 if stalls >= 3:
                     print("连续 3 次抽牌无反应, 停止。")
+                    save_dump(snap(), "stall")
                     return 5
 
     print(f"达到设定轮数 {args.rounds}, 仍未达成{pat_cn}, 停止。")
