@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 百趣演武 · 自动抽牌(第一轮)
@@ -44,7 +44,7 @@ from typing import Dict, List, Optional
 import numpy as np
 from PIL import Image, ImageGrab
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 if getattr(sys, "frozen", False):
     # PyInstaller onefile: 资源解压在 sys._MEIPASS
@@ -846,6 +846,10 @@ def live(args) -> int:
         """放弃挑战 -> 确认 -> 等回到抽牌界面。返回 (成功?, 返回码)。"""
         pos = fr.buttons.get("abandon")
         if not pos:
+            # 可能是翻牌动画中途, 重新截一帧再找一次
+            fr = inspect(snap())
+            pos = fr.buttons.get("abandon")
+        if not pos:
             print("[!] 没找到「放弃挑战」按钮, 停止。")
             return False, 7
         if not safe_click(pos):
@@ -870,6 +874,7 @@ def live(args) -> int:
         if not ok:
             print("[!] 确认后没有回到抽牌界面, 停止。")
             return False, 9
+        time.sleep(0.4)   # 等新一局发牌动画走完
         return True, 0
 
     shot = snap()
@@ -895,6 +900,8 @@ def live(args) -> int:
         if args.rounds and round_no > args.rounds:
             break
         prev_slots = None
+        prev_cards: List[Card] = []
+        low_since = None
         stalls = 0
         no_draw = 0
         last_draw_t = 0.0
@@ -911,7 +918,18 @@ def live(args) -> int:
                 time.sleep(0.8)
                 continue
 
-            cards = fr.cards
+            # 同一局里牌只增不减: 某一帧漏识别不能让张数倒退;
+            # 但如果持续 0.8s 都变少(说明这一局确实重置了), 才接受新结果
+            if len(fr.cards) >= len(prev_cards):
+                prev_cards = fr.cards
+                low_since = None
+            else:
+                if low_since is None:
+                    low_since = time.time()
+                elif time.time() - low_since > 0.8:
+                    prev_cards = fr.cards
+                    low_since = None
+            cards = prev_cards
             n = len(cards)
             action = decide(cards, target)
 
@@ -931,8 +949,10 @@ def live(args) -> int:
                 time.sleep(0.20)
                 fr2 = inspect(snap(), prev_slots)
                 prev_slots = fr2.slots
-                if fr2.cards and decide(fr2.cards, target) != "abandon":
+                if (len(fr2.cards) >= n and fr2.cards
+                        and decide(fr2.cards, target) != "abandon"):
                     print(f"[~] 复查后不放弃({fmt_cards(fr2.cards)}), 继续")
+                    prev_cards = fr2.cards
                     continue
                 print(f"[轮 {round_no:>3}] {n}/{HAND_SIZE}  {pad(fmt_cards(cards), 26)} "
                       f"-> 放弃: {reason}")
@@ -956,7 +976,11 @@ def live(args) -> int:
                 if no_draw > 25:
                     print(f"[!] 没找到可用的抽牌按钮 (已翻开 {fr.revealed}/{HAND_SIZE})")
                     print("    可能原因: 牌库为空 / 不在抽牌界面 / 窗口被挡住。")
-                    return 4
+                    ok, code = do_abandon(fr)
+                    if not ok:
+                        return code
+                    abandons += 1
+                    break
                 time.sleep(0.12)
                 continue
             no_draw = 0
@@ -983,19 +1007,18 @@ def live(args) -> int:
                     got_new = True
                     time.sleep(0.12)
                     break
-                p2 = fr2.buttons.get("draw")
-                if p2 and (time.perf_counter() - last_click) >= 0.7:
-                    if not safe_click(p2):
-                        return 3
-                    last_click = time.perf_counter()
             if got_new:
                 stalls = 0
             else:
                 stalls += 1
                 print(f"[!] 抽牌后未检测到新翻开的牌 (重试 {stalls}/3)")
                 if stalls >= 3:
-                    print("连续 3 次抽牌无反应, 停止。")
-                    return 5
+                    print("[!] 连续 3 次抽牌无反应, 放弃本局重抽")
+                    ok, code = do_abandon(fr)
+                    if not ok:
+                        return 5
+                    abandons += 1
+                    break
 
     print(f"达到设定轮数 {args.rounds}, 仍未达成{pat_cn}, 停止。")
     return 10
