@@ -8,12 +8,12 @@
 
 ## 下载
 
-到 [Releases](https://github.com/minfeihu926/baiqu-yanyu/releases) 下载：
+到 [Releases](https://github.com/minfeihu926/baiqu-yanwu/releases) 下载：
 
 | 文件 | 说明 |
 |---|---|
-| `baiqu_yanyu.exe` | 单文件版，自带 Python 和依赖，双击或命令行运行 |
-| `baiqu_yanyu_win64_portable.zip` | 便携版，解压即用；单文件版被杀软误报时使用 |
+| `baiqu_yanwu.exe` | 单文件版，自带 Python 和依赖，双击或命令行运行 |
+| `baiqu_yanwu_win64_portable.zip` | 便携版，解压即用；单文件版被杀软误报时使用 |
 
 单文件版首次启动会解压到系统临时目录，慢 1~2 秒。exe 未签名，Windows Defender 可能误报。
 
@@ -23,26 +23,26 @@
 2. 先确认能正确识别（不点击）：
 
    ```bat
-   baiqu_yanyu.exe --image 截图.png
+   baiqu_yanwu.exe --image 截图.png
    ```
 
    或直接截图当前游戏窗口看识别结果：
 
    ```bat
-   baiqu_yanyu.exe --check
+   baiqu_yanwu.exe --check
    ```
 
 3. 正式运行，按提示选目标牌型：
 
    ```bat
-   baiqu_yanyu.exe
+   baiqu_yanwu.exe
    ```
 
 4. 达成目标后脚本自动退出，手牌保留，你自己点「开始挑战」。
 
 ```bat
-baiqu_yanyu.exe -p 顺子        # 也可以直接用命令行指定牌型
-baiqu_yanyu.exe -p 同花 -r 20  # 最多跑 20 轮
+baiqu_yanwu.exe -p 顺子        # 也可以直接用命令行指定牌型
+baiqu_yanwu.exe -p 同花 -r 20  # 最多跑 20 轮
 ```
 
 运行期间脚本会独占鼠标，游戏窗口需要在前台，`Ctrl+C` 可随时中断。
@@ -53,7 +53,7 @@ Windows + Python 3.9+：
 
 ```bat
 python -m pip install -r requirements.txt
-python baiqu_yanyu.py
+python baiqu_yanwu.py
 ```
 
 也可以双击 `run.bat`（会自动补依赖）。
@@ -146,10 +146,10 @@ build.bat
 
 ```bat
 python -m pip install -r requirements.txt pyinstaller
-python -m PyInstaller --noconfirm --clean baiqu_yanyu.spec
+python -m PyInstaller --noconfirm --clean baiqu_yanwu.spec
 ```
 
-产物在 `dist\baiqu_yanyu.exe`。推送 `v*` tag 时 GitHub Actions 也会自动构建并上传到 Release。
+产物在 `dist\baiqu_yanwu.exe`。推送 `v*` tag 时 GitHub Actions 也会自动构建并上传到 Release。
 
 ## License
 

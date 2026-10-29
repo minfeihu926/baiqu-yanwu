@@ -25,11 +25,11 @@
 许可证: MIT
 
 用法:
-  python baiqu_yanyu.py                      # 菜单选目标牌型
-  python baiqu_yanyu.py -p 顺子               # 指定牌型
-  python baiqu_yanyu.py -p 同花 -r 20         # 最多 20 轮
-  python baiqu_yanyu.py --check              # 只截图识别, 不点击
-  python baiqu_yanyu.py --image x.png        # 离线分析一张截图
+  python baiqu_yanwu.py                      # 菜单选目标牌型
+  python baiqu_yanwu.py -p 顺子               # 指定牌型
+  python baiqu_yanwu.py -p 同花 -r 20         # 最多 20 轮
+  python baiqu_yanwu.py --check              # 只截图识别, 不点击
+  python baiqu_yanwu.py --image x.png        # 离线分析一张截图
 """
 import argparse
 import ctypes
@@ -44,7 +44,7 @@ from typing import Dict, List, Optional
 import numpy as np
 from PIL import Image, ImageGrab
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 if getattr(sys, "frozen", False):
     # PyInstaller onefile: 资源解压在 sys._MEIPASS
@@ -1042,7 +1042,7 @@ def live(args) -> int:
 
 def main():
     ap = argparse.ArgumentParser(
-        prog="baiqu_yanyu",
+        prog="baiqu_yanwu",
         description="百趣演武自动抽牌: 按选定牌型抽牌, 不可能就放弃重抽。",
     )
     ap.add_argument("--check", action="store_true", help="只截图识别, 不点击")

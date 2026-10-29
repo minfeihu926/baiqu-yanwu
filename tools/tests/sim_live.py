@@ -9,7 +9,7 @@ from contextlib import redirect_stdout
 BASE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, BASE)
 
-import baiqu_yanyu as m  # noqa: E402
+import baiqu_yanwu as m  # noqa: E402
 
 CARD = {"w": "wan", "t": "tiao", "g": "tong"}
 DRAW_POS = (0.90, 0.75)

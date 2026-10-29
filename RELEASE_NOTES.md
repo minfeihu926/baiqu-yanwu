@@ -42,14 +42,14 @@
 
 ### 下载
 
-- `baiqu_yanyu.exe`：单文件版，**无需安装 Python 或任何依赖**
-- `baiqu_yanyu_win64_portable.zip`：便携版，解压即用（单文件版被杀软误报时使用）
+- `baiqu_yanwu.exe`：单文件版，**无需安装 Python 或任何依赖**
+- `baiqu_yanwu_win64_portable.zip`：便携版，解压即用（单文件版被杀软误报时使用）
 
 ### 使用
 
 1. 游戏窗口化运行，进入百趣演武的抽牌界面
-2. `baiqu_yanyu.exe --check` 确认 5 个卡槽都识别正确
-3. `baiqu_yanyu.exe` 选择目标牌型开始运行
+2. `baiqu_yanwu.exe --check` 确认 5 个卡槽都识别正确
+3. `baiqu_yanwu.exe` 选择目标牌型开始运行
 4. 达成目标后脚本退出，手牌保留，手动点「开始挑战」
 
 ### 注意

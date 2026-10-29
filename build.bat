@@ -7,10 +7,10 @@ python -m pip install -r requirements.txt pyinstaller
 if errorlevel 1 goto fail
 
 echo [2/3] 打包单文件 exe...
-python -m PyInstaller --noconfirm --clean baiqu_yanyu.spec
+python -m PyInstaller --noconfirm --clean baiqu_yanwu.spec
 if errorlevel 1 goto fail
 
-echo [3/3] 完成: dist\baiqu_yanyu.exe
+echo [3/3] 完成: dist\baiqu_yanwu.exe
 pause
 exit /b 0
 

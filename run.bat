@@ -11,6 +11,6 @@ if errorlevel 1 (
         exit /b 1
     )
 )
-python baiqu_yanyu.py %*
+python baiqu_yanwu.py %*
 echo.
 pause

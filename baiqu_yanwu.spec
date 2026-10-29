@@ -2,7 +2,7 @@
 """PyInstaller 打包配置: 单文件、带控制台、内置识别模板。"""
 
 a = Analysis(
-    ['baiqu_yanyu.py'],
+    ['baiqu_yanwu.py'],
     pathex=[],
     binaries=[],
     datas=[('templates', 'templates')],
@@ -20,7 +20,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='baiqu_yanyu',
+    name='baiqu_yanwu',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

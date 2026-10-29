@@ -6,6 +6,6 @@ if errorlevel 1 (
     echo [setup] installing numpy pillow ...
     python -m pip install numpy pillow
 )
-python baiqu_yanyu.py --check
+python baiqu_yanwu.py --check
 echo.
 pause

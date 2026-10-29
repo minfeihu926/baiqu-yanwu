@@ -6,7 +6,7 @@ import sys
 BASE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, BASE)
 
-from baiqu_yanyu import Card, decide, is_hit, can_complete  # noqa: E402
+from baiqu_yanwu import Card, decide, is_hit, can_complete  # noqa: E402
 
 W, T, G = "wan", "tiao", "tong"
 
