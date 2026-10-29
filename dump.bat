@@ -8,5 +8,5 @@ if errorlevel 1 (
 )
 python baiqu_yanwu.py --check --dump "%~dp0shot.png"
 echo.
-echo 已保存 shot.png, 把它发给我即可排查识别问题。
+echo Saved shot.png - send it back if recognition looks wrong.
 pause
