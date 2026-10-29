@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 百趣演武 · 自动抽牌(第一轮)
@@ -44,7 +44,7 @@ from typing import Dict, List, Optional
 import numpy as np
 from PIL import Image, ImageGrab
 
-__version__ = "1.4.2"
+__version__ = "1.0.1"
 
 if getattr(sys, "frozen", False):
     # PyInstaller onefile: 资源解压在 sys._MEIPASS
