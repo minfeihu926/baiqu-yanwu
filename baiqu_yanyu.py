@@ -41,7 +41,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from PIL import Image, ImageGrab
 
-__version__ = "1.1.3"
+__version__ = "1.1.4"
 
 if getattr(sys, "frozen", False):
     # PyInstaller onefile: 资源解压在 sys._MEIPASS
@@ -65,8 +65,8 @@ HAND_SIZE = 5                  # 手牌张数
 RANK_BOX = (0.1104, 0.1173, 0.1015, 0.0752)   # 点数
 SUIT_BOX = (0.2985, 0.1283, 0.0597, 0.0487)   # 花色(小字形)
 
-SEARCH_MARGIN = 0.05           # 取样框外扩比例(相对卡宽), 容忍卡槽推算的几像素误差
-SEARCH_MAX_MARGIN_PX = 16      # 搜索边距上限(像素), 防止卡槽尺寸异常时搜索爆炸
+SEARCH_MARGIN = 0.08           # 取样框外扩比例(相对卡宽), 容忍卡槽推算的偏差
+SEARCH_MAX_MARGIN_PX = 26      # 搜索边距上限(像素), 防止卡槽尺寸异常时搜索爆炸
 
 # 单张卡牌应占窗口的比例(由 2560x1600 截图测得), 用来剔除错误的卡槽
 CARD_W_RANGE = (0.10, 0.17)
@@ -76,8 +76,8 @@ CARD_ASPECT = 452 / 335        # 卡牌 高/宽, 由截图测得
 MATCH_MIN = 0.55               # 模板匹配最低分(0~1)
 MATCH_MARGIN = 0.04            # 第一名与第二名的最小差距, 否则视为不确定
 
-REVEAL_WHITE = 0.22            # 卡牌"已翻开"判定: 白色像素占比阈值
-REVEAL_DARK = 0.03             # 同时要有深色笔画, 防止翻牌中途误判
+REVEAL_WHITE = 0.15            # 卡牌"已翻开"判定: 白色像素占比阈值
+REVEAL_DARK = 0.02             # 同时要有深色笔画, 防止翻牌中途误判
 
 DRAW_WAIT = 3.0                # 点抽牌后等待翻牌的时间
 CONFIRM_WAIT = 3.0             # 点放弃后等待弹窗的时间
@@ -598,16 +598,35 @@ def read_card(gray: np.ndarray, s: Slot):
     rpatch = gray[max(0, rb[1] - m):min(H, rb[3] + m),
                   max(0, rb[0] - m):min(W, rb[2] + m)]
 
-    rank_best, rank_off = {}, None
-    for r in RANKS:
-        sc, ox, oy = _match(rpatch, tpl[f"r{r}"], (tw, th))
-        rank_best[str(r)] = sc
-        if rank_off is None or sc > rank_off[0]:
-            rank_off = (sc, ox, oy)
+    ph, pw = rpatch.shape[:2]
+
+    def rank_pass(scales):
+        scores, best_off = {}, None
+        for r in RANKS:
+            sc_r, off_r = -1.0, (0.0, 0, 0)
+            for f in scales:
+                size = (int(round(tw * f)), int(round(th * f)))
+                if size[0] < 6 or size[1] < 6 or size[0] >= pw or size[1] >= ph:
+                    continue
+                sc, ox, oy = _match(rpatch, tpl[f"r{r}"], size)
+                if sc > sc_r:
+                    sc_r, off_r = sc, (sc, ox, oy)
+            scores[str(r)] = max(sc_r, 0.0)
+            if best_off is None or sc_r > best_off[0]:
+                best_off = off_r
+        return scores, best_off
+
+    rank_best, rank_off = rank_pass((1.0,))
     rk, rs, rm = _best(rank_best)
+    if rs < 0.82 or rm < 0.10:
+        # 卡片缩放/比例与模板有偏差时, 再试几个尺度
+        rank_best2, rank_off2 = rank_pass((0.85, 0.92, 1.08, 1.15))
+        if max(rank_best2.values(), default=0.0) > rs:
+            rank_best, rank_off = rank_best2, rank_off2
+            rk, rs, rm = _best(rank_best)
 
     dx = dy = 0
-    if rk is not None:
+    if rk is not None and rank_off is not None:
         dx = max(-m, min(m, int(rank_off[1]) - m))
         dy = max(-m, min(m, int(rank_off[2]) - m))
 
@@ -971,6 +990,41 @@ def live(args) -> int:
             print(f"[!] {e}")
             return False
 
+    state = {"abandons": 0}
+
+    def abandon_round(reason: str) -> bool:
+        """放弃当前这一局并确认, 等到重新回到抽牌界面。失败返回 False。"""
+        fr_a = inspect(snap())
+        pos = fr_a.buttons.get("abandon")
+        if not pos:
+            print(f"[!] {reason}, 但没找到「放弃挑战」按钮。")
+            return False
+        print(f"[轮 {round_no:>3}] 放弃: {reason}")
+        if not safe_click(pos):
+            return False
+        fr_b, ok = wait_frame(snap, lambda f_: f_.buttons.get("confirm") is not None,
+                              CONFIRM_WAIT)
+        if not ok:
+            print("[!] 放弃确认弹窗没出现, 重试一次")
+            if not safe_click(pos):
+                return False
+            fr_b, ok = wait_frame(snap, lambda f_: f_.buttons.get("confirm") is not None,
+                                  CONFIRM_WAIT)
+            if not ok:
+                print("[!] 放弃弹窗仍未出现。")
+                return False
+        if not safe_click(fr_b.buttons["confirm"]):
+            return False
+        state["abandons"] += 1
+        _, ok = wait_frame(
+            snap,
+            lambda f_: f_.revealed == 0 and f_.buttons.get("draw") is not None,
+            RESET_WAIT)
+        if not ok:
+            print("[!] 确认后没有回到抽牌界面。")
+            return False
+        return True
+
     shot = snap()
     fr = inspect(shot)
     print(f"初始: 手牌 {fr.revealed}/{HAND_SIZE} -> {fmt_cards(fr.cards)}")
@@ -987,7 +1041,14 @@ def live(args) -> int:
 
     t_start = time.time()
     round_no = 0
-    abandons = 0
+
+    # 开局如果桌上已经有牌(上一局没打完/手牌已满), 先放弃重开一局, 保证从 5 张卡背开始
+    if fr.revealed > 0:
+        print(f"[!] 开局已有 {fr.revealed} 张手牌, 先放弃重开一局")
+        if not abandon_round("开局已有手牌"):
+            print("    请手动放弃/打完这一局后再运行。")
+            return 11
+
     while True:
         round_no += 1
         if args.rounds and round_no > args.rounds:
@@ -1016,13 +1077,16 @@ def live(args) -> int:
             if fr.unknown:
                 unknown_streak += 1
                 if unknown_streak > UNKNOWN_GIVE_UP:
-                    print(f"[!] 有 {fr.unknown} 张牌识别不确定, 停止脚本以免误放弃。")
                     for i, s in enumerate(fr.slots):
                         if s.revealed and (s.card is None or not s.card.known):
-                            print(f"    槽位 #{i+1} 点数分={s.card.rank_score if s.card else 0:.2f} "
-                                  f"花色分={s.card.suit_score if s.card else 0:.2f}")
-                    save_dump(snap(), "unknown")
-                    return 6
+                            print(f"    [!] 槽位 #{i+1} 认不准 "
+                                  f"(点数 {s.card.rank_score if s.card else 0:.2f} / "
+                                  f"花色 {s.card.suit_score if s.card else 0:.2f})")
+                    print(f"[轮 {round_no:>3}] 有 {fr.unknown} 张牌识别不确定 -> 放弃本局重抽")
+                    if not abandon_round("识别不确定"):
+                        save_dump(snap(), "unknown")
+                        return 6
+                    break
                 time.sleep(0.12)
                 continue
             unknown_streak = 0
@@ -1060,7 +1124,7 @@ def live(args) -> int:
                 cost = time.time() - t_start
                 print(f"[命中] 第 {round_no} 轮  {n}/{HAND_SIZE}  {fmt_cards(cards)}")
                 print(f"       牌型 {pat_cn} 达成; 用时 {cost/60:.1f} 分钟, "
-                      f"共 {round_no} 轮, 放弃 {abandons} 次。")
+                      f"共 {round_no} 轮, 放弃 {state['abandons']} 次。")
                 print("       已停手, 手牌保留; 需要你自己点「开始挑战」。")
                 return 0
 
@@ -1081,35 +1145,11 @@ def live(args) -> int:
                     print(f"[~] 复查后放弃条件不成立({fmt_cards(fr2.cards)}), 继续")
                     prev_cards = fr2.cards
                     continue
-                pos = fr.buttons.get("abandon")
-                if not pos:
-                    print("[!] 判定该放弃, 但没找到「放弃挑战」按钮, 停止。")
-                    return 7
                 print(f"[轮 {round_no:>3}] {n}/{HAND_SIZE}  {pad(fmt_cards(cards), 26)} "
-                      f"-> 放弃: {reason}")
-                if not safe_click(pos):
-                    return 3
-                fr3, ok = wait_frame(snap, lambda f_: f_.buttons.get("confirm") is not None,
-                                     CONFIRM_WAIT, prev_slots)
-                if not ok:
-                    print("[!] 放弃确认弹窗没出现, 重试一次")
-                    if not safe_click(pos):
-                        return 3
-                    fr3, ok = wait_frame(snap, lambda f_: f_.buttons.get("confirm") is not None,
-                                         CONFIRM_WAIT, prev_slots)
-                    if not ok:
-                        print("[!] 放弃弹窗仍未出现, 停止。")
-                        return 8
-                if not safe_click(fr3.buttons["confirm"]):
-                    return 3
-                abandons += 1
-                fr4, ok = wait_frame(
-                    snap,
-                    lambda f_: f_.revealed == 0 and f_.buttons.get("draw") is not None,
-                    RESET_WAIT, prev_slots)
-                if not ok:
-                    print("[!] 确认后没有回到抽牌界面, 停止。")
-                    return 9
+                      f"-> {reason}")
+                if not abandon_round(reason):
+                    save_dump(snap(), "abandon")
+                    return 7
                 break  # 进入下一轮
 
             # 继续抽一张
@@ -1119,6 +1159,9 @@ def live(args) -> int:
                 if no_draw > 25:
                     print(f"[!] 没找到可用的抽牌按钮 (已翻开 {fr.revealed}/{HAND_SIZE})")
                     print("    可能原因: 牌库为空 / 不在抽牌界面 / 分辨率或 UI 缩放不匹配。")
+                    if abandon_round("抽牌按钮不可用"):
+                        break
+                    save_dump(snap(), "nodraw")
                     return 4
                 time.sleep(0.12)
                 continue
@@ -1158,7 +1201,9 @@ def live(args) -> int:
                 stalls += 1
                 print(f"[!] 抽牌后未检测到新翻开的牌 (重试 {stalls}/3)")
                 if stalls >= 3:
-                    print("连续 3 次抽牌无反应, 停止。")
+                    print("[!] 连续 3 次抽牌无反应")
+                    if abandon_round("抽牌无响应"):
+                        break
                     save_dump(snap(), "stall")
                     return 5
 
