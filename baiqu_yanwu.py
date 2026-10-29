@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 百趣演武 · 自动抽牌(第一轮)
@@ -44,7 +44,7 @@ from typing import Dict, List, Optional
 import numpy as np
 from PIL import Image, ImageGrab
 
-__version__ = "1.4.1"
+__version__ = "1.4.2"
 
 if getattr(sys, "frozen", False):
     # PyInstaller onefile: 资源解压在 sys._MEIPASS
@@ -877,19 +877,20 @@ def live(args) -> int:
         if not pos:
             print("[!] 没找到「放弃挑战」按钮, 停止。")
             return False, 7
-        if not safe_click(pos):
-            return False, 3
-        fr2, ok = wait_frame(snap, lambda f_: f_.buttons.get("confirm") is not None,
-                             CONFIRM_WAIT)
-        if not ok:
-            print("[!] 放弃确认弹窗没出现, 重试一次")
+        # 手牌刚发完时游戏可能还锁着输入, 点和等都不能只做一次
+        fr2, ok = None, False
+        for attempt in range(1, 5):
             if not safe_click(pos):
                 return False, 3
             fr2, ok = wait_frame(snap, lambda f_: f_.buttons.get("confirm") is not None,
                                  CONFIRM_WAIT)
-            if not ok:
-                print("[!] 放弃弹窗仍未出现, 停止。")
-                return False, 8
+            if ok:
+                break
+            print(f"[!] 放弃确认弹窗没出现, 再点一次 ({attempt}/4)")
+            time.sleep(0.3)
+        if not ok:
+            print("[!] 放弃弹窗一直没出现, 停止。")
+            return False, 8
         if not safe_click(fr2.buttons["confirm"]):
             return False, 3
         _, ok = wait_frame(
@@ -1037,7 +1038,7 @@ def live(args) -> int:
                     break
                 # 画面完全没动、抽牌按钮还亮着 = 这次点击没生效 -> 补点
                 p2 = fr2.buttons.get("draw")
-                if (p2 and (time.perf_counter() - last_click) > 0.6
+                if (p2 and (time.perf_counter() - last_click) > 0.45
                         and fr2.revealed <= before and fr2.teal >= before_teal):
                     if not safe_click(p2):
                         return 3
