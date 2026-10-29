@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 百趣演武 · 自动抽牌(第一轮)
@@ -432,7 +432,8 @@ def detect_teal_slots(img: Image.Image, a=None):
         # 卡背底部有青色反光, 直接取 ys.max() 会把卡槽拉高; 按卡牌固定长宽比重算
         top = int(ys.min())
         w = int(x1) - int(x0) + 1
-        aspect = 1.506 if W / H > 1.65 else CARD_ASPECT   # 16:9 卡牌更高\n        h = int(round(w * aspect))
+        aspect = 1.506 if W / H > 1.65 else CARD_ASPECT   # 16:9 卡牌更高
+        h = int(round(w * aspect))
         if not (CARD_H_RANGE[0] * H <= h <= CARD_H_RANGE[1] * H):
             continue
         slots.append(Slot(int(x0), top, int(x0) + w, top + h))
